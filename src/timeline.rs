@@ -38,7 +38,7 @@ pub fn current_line(timeline: &Timeline, ms: u64) -> Option<usize> {
         .enumerate()
         .filter(|(_, line)| !line.missing && line.start_ms <= ms)
         .map(|(index, _)| index)
-        .last()
+        .next_back()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -67,6 +67,7 @@ pub struct App {
     show_ruby: bool,
     error: Option<String>,
     meter_state: MeterViewState,
+    last_seek_epoch: u64,
 }
 
 impl App {
@@ -79,6 +80,7 @@ impl App {
             show_ruby: true,
             error: None,
             meter_state: MeterViewState::default(),
+            last_seek_epoch: 0,
         };
         if let Some(script_path) = script_path {
             app.open_project(script_path);
@@ -107,6 +109,7 @@ impl App {
                         self.output = Some(output);
                         self.error = None;
                         self.meter_state.reset();
+                        self.last_seek_epoch = 0;
                     }
                     Err(error) => self.error = Some(error),
                 }
@@ -118,15 +121,35 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if let Some(message) = self.output.as_ref().and_then(Output::error_message) {
+            if let Ok(mut transport) = self.transport.lock() {
+                transport.set_mode(Mode::Stopped);
+            }
+            self.error = Some(format!("出力デバイスエラー: {message}"));
+        }
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
-            if self.output.as_ref().is_some_and(Output::has_error) {
-                ui.colored_label(egui::Color32::RED, "出力デバイスでエラーが発生しました");
-            }
             if let Some(project) = &self.project {
-                for warning in &project.warnings.0 {
+                let missing_count = project
+                    .warnings
+                    .0
+                    .iter()
+                    .filter(|warning| is_line_availability_warning(warning))
+                    .count();
+                if missing_count > 0 {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("timeline.json と対応しない台本行: {missing_count}件"),
+                    );
+                }
+                for warning in project
+                    .warnings
+                    .0
+                    .iter()
+                    .filter(|warning| !is_line_availability_warning(warning))
+                {
                     ui.colored_label(egui::Color32::YELLOW, warning);
                 }
             }
@@ -154,13 +177,20 @@ impl eframe::App for App {
             .exact_width(90.0)
             .show(ctx, |ui| {
                 if let Some(project) = &self.project {
-                    let (position_ms, stopped) = self
+                    let (position_ms, stopped, seek_epoch) = self
                         .transport
                         .lock()
-                        .map(|transport| (transport.position_ms(), transport.mode() == Mode::Stopped))
-                        .unwrap_or((0, true));
-                    if stopped {
+                        .map(|transport| {
+                            (
+                                transport.position_ms(),
+                                transport.mode() == Mode::Stopped,
+                                transport.seek_epoch(),
+                            )
+                        })
+                        .unwrap_or((0, true, 0));
+                    if stopped || seek_epoch != self.last_seek_epoch {
                         self.meter_state.reset();
+                        self.last_seek_epoch = seek_epoch;
                     }
                     let meter = analyze_meter(
                         &project.audio.samples,
@@ -204,6 +234,10 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
     }
+}
+
+fn is_line_availability_warning(warning: &str) -> bool {
+    warning.contains("timeline.json にありません") || warning.contains("missing:true")
 }
 
 #[cfg(test)]
@@ -256,5 +290,43 @@ mod tests {
         assert_eq!(loaded.timeline.lines.len(), 1);
         assert_eq!(loaded.audio.channels, 1);
         std::fs::remove_dir_all(project_dir).expect("remove project directory");
+    }
+
+    #[test]
+    fn warns_only_when_audio_duration_differs_by_more_than_one_second() {
+        for (name, timeline_duration, expects_warning) in
+            [("duration-warning", 0_u64, true), ("duration-match", 2_000_u64, false)]
+        {
+            let project_dir = temp_project(name);
+            let script_path = project_dir.join("第1回.txt");
+            let script = "[S01-L001] 蒼真:こんにちは\n";
+            std::fs::write(&script_path, script).expect("write script");
+            std::fs::write(
+                project_dir.join("timeline").join("timeline.json"),
+                format!(
+                    r#"{{"script_sha256":"{}","duration_ms":{timeline_duration},"sample_rate":48000,"lines":[{{"id":"S01-L001","start_ms":0,"end_ms":2000,"text":"こんにちは","missing":false}}]}}"#,
+                    crate::timeline::sha256_hex(script.as_bytes())
+                ),
+            )
+            .expect("write timeline");
+            let spec = WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 16,
+                sample_format: SampleFormat::Int,
+            };
+            let mut writer = WavWriter::create(project_dir.join("full_dialogue.wav"), spec).expect("create wav");
+            for _ in 0..96_000 {
+                writer.write_sample(0_i16).expect("write wav");
+            }
+            writer.finalize().expect("finalize wav");
+
+            let project = load_project(&script_path).expect("load project");
+            assert_eq!(
+                project.warnings.0.iter().any(|warning| warning.contains("音声長")),
+                expects_warning
+            );
+            std::fs::remove_dir_all(project_dir).expect("remove project directory");
+        }
     }
 }

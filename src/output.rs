@@ -10,11 +10,16 @@ use crate::{audio::AudioData, transport::Transport};
 pub struct Output {
     _stream: cpal::Stream,
     error: Arc<AtomicBool>,
+    error_message: Arc<Mutex<Option<String>>>,
 }
 
 impl Output {
     pub fn has_error(&self) -> bool {
         self.error.load(Ordering::Relaxed)
+    }
+
+    pub fn error_message(&self) -> Option<String> {
+        self.error_message.lock().ok()?.clone()
     }
 }
 
@@ -27,22 +32,28 @@ pub fn start_output(
         .default_output_device()
         .ok_or_else(|| "既定の出力デバイスがありません".to_owned())?;
     let supported = device
-        .default_output_config()
-        .map_err(|error| format!("既定の出力設定を取得できません: {error}"))?;
-    if supported.sample_rate().0 != audio.sample_rate {
-        return Err(format!(
-            "出力デバイスのサンプルレート {}Hz は音声の {}Hz と一致しません",
-            supported.sample_rate().0,
-            audio.sample_rate
-        ));
-    }
+        .supported_output_configs()
+        .map_err(|error| format!("出力設定を取得できません: {error}"))?
+        .find(|config| {
+            config.min_sample_rate().0 <= audio.sample_rate
+                && audio.sample_rate <= config.max_sample_rate().0
+        })
+        .map(|config| config.with_sample_rate(cpal::SampleRate(audio.sample_rate)))
+        .ok_or_else(|| format!("出力デバイスは {}Hz に対応していません", audio.sample_rate))?;
 
     let config = supported.config();
     let device_channels = config.channels;
     let error = Arc::new(AtomicBool::new(false));
+    let error_message = Arc::new(Mutex::new(None));
     let error_callback = {
         let error = Arc::clone(&error);
-        move |_: cpal::StreamError| error.store(true, Ordering::Relaxed)
+        let error_message = Arc::clone(&error_message);
+        move |stream_error: cpal::StreamError| {
+            error.store(true, Ordering::Relaxed);
+            if let Ok(mut message) = error_message.lock() {
+                *message = Some(stream_error.to_string());
+            }
+        }
     };
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => build_stream(
@@ -81,6 +92,7 @@ pub fn start_output(
     Ok(Output {
         _stream: stream,
         error,
+        error_message,
     })
 }
 

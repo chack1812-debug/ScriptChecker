@@ -14,6 +14,7 @@ pub struct Transport {
     total_frames: u64,
     sample_rate: u32,
     mode: Mode,
+    seek_epoch: u64,
 }
 
 impl Transport {
@@ -23,6 +24,7 @@ impl Transport {
             total_frames,
             sample_rate,
             mode: Mode::Stopped,
+            seek_epoch: 0,
         }
     }
 
@@ -44,7 +46,18 @@ impl Transport {
 
     pub fn seek_ms(&mut self, ms: i64) {
         let requested = ms.max(0) as f64 * f64::from(self.sample_rate) / 1_000.0;
-        self.pos_frames = requested.min(self.total_frames as f64);
+        let clamped = requested.min(self.total_frames as f64);
+        if ms < 0 || requested >= self.total_frames as f64 {
+            self.mode = Mode::Stopped;
+        }
+        if self.pos_frames != clamped {
+            self.pos_frames = clamped;
+            self.seek_epoch = self.seek_epoch.wrapping_add(1);
+        }
+    }
+
+    pub fn seek_epoch(&self) -> u64 {
+        self.seek_epoch
     }
 
     pub fn skip_ms(&mut self, delta_ms: i64) {
@@ -65,7 +78,13 @@ impl Transport {
                 self.clamp_position();
                 break;
             }
-            let source_frame = self.pos_frames.floor() as usize;
+            let source_frame = if matches!(self.mode, Mode::Rewind)
+                && self.pos_frames >= self.total_frames as f64
+            {
+                self.total_frames.saturating_sub(1) as usize
+            } else {
+                self.pos_frames.floor() as usize
+            };
             let source_start = source_frame * channels;
             let Some(source) = samples.get(source_start..source_start + channels) else {
                 self.mode = Mode::Stopped;
@@ -161,16 +180,24 @@ mod tests {
 
         transport.seek_ms(-5);
         assert_eq!(transport.position_ms(), 0);
+        assert_eq!(transport.mode(), Mode::Stopped);
         transport.seek_ms(20_001);
         assert_eq!(transport.position_ms(), 20_000);
+
         transport.skip_ms(-10_000);
         assert_eq!(transport.position_ms(), 10_000);
         transport.skip_ms(10_000);
         assert_eq!(transport.position_ms(), 20_000);
 
+        transport.set_mode(Mode::Rewind);
+        transport.render(&samples, 2, &mut output);
+        assert_eq!(output[..4], [19_999.0, -19_999.0, 19_996.0, -19_996.0]);
+        assert_eq!(transport.mode(), Mode::Rewind);
+        assert_eq!(transport.position_ms(), 19_960);
+
         transport.set_mode(Mode::Stopped);
         transport.render(&samples, 2, &mut output);
         assert!(output.iter().all(|sample| *sample == 0.0));
-        assert_eq!(transport.position_ms(), 20_000);
+        assert_eq!(transport.position_ms(), 19_960);
     }
 }
