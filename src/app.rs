@@ -8,10 +8,15 @@ use eframe::egui;
 use crate::{
     audio::{load_wav, AudioData},
     output::{start_output, Output},
+    meter::analyze_meter,
     script::{parse_script, ScriptItem},
     timeline::{check_consistency, parse_timeline, Timeline, Warnings},
     transport::{Mode, Transport},
-    ui::{controls::draw_controls, script_view::draw_script},
+    ui::{
+        controls::draw_controls,
+        meter_view::{draw_meter, MeterViewState, METER_WINDOW_S},
+        script_view::draw_script,
+    },
 };
 
 pub struct Project {
@@ -61,6 +66,7 @@ pub struct App {
     follow: bool,
     show_ruby: bool,
     error: Option<String>,
+    meter_state: MeterViewState,
 }
 
 impl App {
@@ -72,6 +78,7 @@ impl App {
             follow: true,
             show_ruby: true,
             error: None,
+            meter_state: MeterViewState::default(),
         };
         if let Some(script_path) = script_path {
             app.open_project(script_path);
@@ -99,6 +106,7 @@ impl App {
                         self.transport = transport;
                         self.output = Some(output);
                         self.error = None;
+                        self.meter_state.reset();
                     }
                     Err(error) => self.error = Some(error),
                 }
@@ -144,7 +152,26 @@ impl eframe::App for App {
         });
         egui::SidePanel::right("meter")
             .exact_width(90.0)
-            .show(ctx, |ui| ui.label("メーター\n(Task 8)"));
+            .show(ctx, |ui| {
+                if let Some(project) = &self.project {
+                    let (position_ms, stopped) = self
+                        .transport
+                        .lock()
+                        .map(|transport| (transport.position_ms(), transport.mode() == Mode::Stopped))
+                        .unwrap_or((0, true));
+                    if stopped {
+                        self.meter_state.reset();
+                    }
+                    let meter = analyze_meter(
+                        &project.audio.samples,
+                        project.audio.channels,
+                        project.audio.sample_rate,
+                        position_ms as f32 / 1_000.0,
+                        METER_WINDOW_S,
+                    );
+                    draw_meter(ui, &mut self.meter_state, &meter);
+                }
+            });
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(project) = &self.project {
                 ui.heading(project.script_path.display().to_string());
