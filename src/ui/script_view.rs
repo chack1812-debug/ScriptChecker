@@ -780,6 +780,183 @@ mod tests {
         }
     }
 
+    fn visual_items(line_count: usize) -> Vec<ScriptItem> {
+        (0..line_count)
+            .map(|index| {
+                ScriptItem::Line(ScriptLine {
+                    id: format!("S01-L{:03}", index + 1),
+                    scene: "S01".to_owned(),
+                    cast: "蒼真".to_owned(),
+                    segs: vec![Seg::Plain(format!("描画テキスト{index}"))],
+                })
+            })
+            .collect()
+    }
+
+    fn visual_timeline(items: &[ScriptItem]) -> Timeline {
+        Timeline {
+            script_sha256: String::new(),
+            duration_ms: items.len() as u64 * 1_000,
+            sample_rate: 48_000,
+            lines: items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| match item {
+                    ScriptItem::Line(line) => Some(crate::timeline::TimelineLine {
+                        id: line.id.clone(),
+                        start_ms: index as u64 * 1_000,
+                        end_ms: index as u64 * 1_000 + 999,
+                        text: crate::script::display_text(&line.segs),
+                        missing: false,
+                    }),
+                    ScriptItem::Scene(_) => None,
+                })
+                .collect(),
+        }
+    }
+
+    fn text_shape_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn count(shape: &egui::epaint::Shape) -> usize {
+            match shape {
+                egui::epaint::Shape::Text(_) => 1,
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().map(count).sum(),
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|clipped| count(&clipped.shape)).sum()
+    }
+
+    fn draw_visual_frame(
+        ctx: &egui::Context,
+        items: &[ScriptItem],
+        timeline: &Timeline,
+        pos_ms: u64,
+        follow: bool,
+        events: Vec<egui::Event>,
+        state: &mut ScriptViewState,
+    ) -> eframe::egui::FullOutput {
+        ctx.run(selection_input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = draw_script(ui, items, timeline, pos_ms, follow, false, state);
+            });
+        })
+    }
+
+    #[test]
+    fn headless_script_draws_text_at_start_middle_end_and_follow_position() {
+        let ctx = egui::Context::default();
+        let items = visual_items(40);
+        let timeline = visual_timeline(&items);
+        let mut state = ScriptViewState::default();
+        let start = draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state);
+        let middle = draw_visual_frame(
+            &ctx,
+            &items,
+            &timeline,
+            0,
+            false,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(160.0, 60.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -320.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut state,
+        );
+        let end = draw_visual_frame(
+            &ctx,
+            &items,
+            &timeline,
+            0,
+            false,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(160.0, 60.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -10_000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut state,
+        );
+        let followed = draw_visual_frame(&ctx, &items, &timeline, 26_000, true, vec![], &mut state);
+        for (name, output) in [
+            ("start", start),
+            ("middle", middle),
+            ("end", end),
+            ("follow", followed),
+        ] {
+            assert!(
+                text_shape_count(&output.shapes) > 0,
+                "{name} viewport must paint text"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn episode_60_script_draws_text_at_all_scroll_positions_and_follow() {
+        let root = std::path::Path::new(r"D:\UDS\YouTube\AI道具箱\第60回");
+        let items = crate::script::parse_script(
+            &std::fs::read_to_string(root.join("第60回.txt")).expect("episode 60 script exists"),
+        );
+        let timeline = crate::timeline::parse_timeline(
+            &std::fs::read_to_string(root.join("timeline").join("timeline.json"))
+                .expect("episode 60 timeline exists"),
+        )
+        .expect("episode 60 timeline parses");
+        let ctx = egui::Context::default();
+        let mut state = ScriptViewState::default();
+        for output in [
+            draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state),
+            draw_visual_frame(
+                &ctx,
+                &items,
+                &timeline,
+                0,
+                false,
+                vec![
+                    egui::Event::PointerMoved(Pos2::new(160.0, 60.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -500.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut state,
+            ),
+            draw_visual_frame(
+                &ctx,
+                &items,
+                &timeline,
+                0,
+                false,
+                vec![
+                    egui::Event::PointerMoved(Pos2::new(160.0, 60.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -10_000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut state,
+            ),
+            draw_visual_frame(
+                &ctx,
+                &items,
+                &timeline,
+                timeline.duration_ms * 2 / 3,
+                true,
+                vec![],
+                &mut state,
+            ),
+        ] {
+            assert!(text_shape_count(&output.shapes) > 0);
+        }
+    }
+
     #[test]
     fn headless_drag_selection_copies_text_with_ctrl_c() {
         let ctx = egui::Context::default();
