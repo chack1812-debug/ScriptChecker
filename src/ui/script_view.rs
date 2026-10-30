@@ -1,4 +1,8 @@
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 
@@ -66,6 +70,7 @@ struct ScriptToken {
     ruby: Option<String>,
     width: f32,
     ruby_width: f32,
+    base_width: f32,
     char_start: usize,
     char_count: usize,
     prohibit_line_start: bool,
@@ -84,7 +89,8 @@ struct LineLayout {
 
 #[derive(Clone, Default)]
 struct LayoutCache {
-    entries: HashMap<(String, u32, bool), LineLayout>,
+    width_bits: u32,
+    entries: HashMap<(String, bool), Arc<LineLayout>>,
 }
 
 pub fn draw_line(
@@ -116,11 +122,17 @@ pub fn draw_script(
         (previous != Some(current), follow && !previous_follow)
     });
     let cache_id = ui.id().with("script-layout-cache");
-    let mut cache: LayoutCache = ui
-        .ctx()
-        .data_mut(|data| data.get_temp(cache_id).unwrap_or_default());
+    let cache = ui.ctx().data_mut(|data| {
+        data.get_temp::<Arc<Mutex<LayoutCache>>>(cache_id)
+            .unwrap_or_else(|| {
+                let cache = Arc::new(Mutex::new(LayoutCache::default()));
+                data.insert_temp(cache_id, Arc::clone(&cache));
+                cache
+            })
+    });
     let mut seek_to = None;
     egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+        let viewport = viewport.translate(ui.min_rect().min.to_vec2());
         for item in items {
             match item {
                 ScriptItem::Scene(SceneHead { id, name }) => {
@@ -128,12 +140,22 @@ pub fn draw_script(
                     ui.heading(format!("{id} {name}"));
                 }
                 ScriptItem::Line(line) => {
-                    let key = (line.id.clone(), content_width(ui).to_bits(), show_ruby);
-                    let layout = cache
-                        .entries
-                        .entry(key)
-                        .or_insert_with(|| build_layout(ui, line, content_width(ui), show_ruby))
-                        .clone();
+                    let width = content_width(ui);
+                    let layout = {
+                        let mut cache = cache.lock().expect("script layout cache poisoned");
+                        if cache.width_bits != width.to_bits() {
+                            cache.width_bits = width.to_bits();
+                            cache.entries.clear();
+                        }
+                        Arc::clone(
+                            cache
+                                .entries
+                                .entry((format!("{}:{:?}", line.id, line.segs), show_ruby))
+                                .or_insert_with(|| {
+                                    Arc::new(build_layout(ui, line, width, show_ruby))
+                                }),
+                        )
+                    };
                     let timeline_index = timeline
                         .lines
                         .iter()
@@ -163,7 +185,6 @@ pub fn draw_script(
             }
         }
     });
-    ui.ctx().data_mut(|data| data.insert_temp(cache_id, cache));
     seek_to
 }
 
@@ -203,12 +224,14 @@ fn build_layout(ui: &egui::Ui, line: &ScriptLine, max_width: f32, show_ruby: boo
             Seg::Plain(text) => {
                 for character in text.chars() {
                     let base = character.to_string();
+                    let base_width = text_width(ui, &base, &base_font);
                     tokens.push(ScriptToken {
-                        width: text_width(ui, &base, &base_font),
+                        width: base_width,
                         prohibit_line_start: KINSOKU_LINE_START.contains(character),
                         base,
                         ruby: None,
                         ruby_width: 0.0,
+                        base_width,
                         char_start,
                         char_count: 1,
                     });
@@ -228,6 +251,7 @@ fn build_layout(ui: &egui::Ui, line: &ScriptLine, max_width: f32, show_ruby: boo
                     ruby: show_ruby.then(|| reading.clone()),
                     width: base_width.max(ruby_width),
                     ruby_width,
+                    base_width,
                     char_start,
                     char_count,
                     prohibit_line_start: false,
@@ -280,32 +304,32 @@ fn paint_line(
     );
     let painter = ui.painter_at(rect);
     if matches!(state, LineState::Current { .. }) {
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(50, 75, 105));
+        painter.rect_filled(rect, 0.0, current_background(ui.visuals()));
     }
     painter.text(
         Pos2::new(rect.left(), rect.top() + layout.ruby_top),
         Align2::LEFT_TOP,
         format!("{}:", line.cast),
         FontId::proportional(layout.base_size),
-        Color32::WHITE,
+        ui.visuals().strong_text_color(),
     );
     for (row_index, range) in layout.rows.iter().enumerate() {
         let mut x = rect.left() + SPEAKER_WIDTH;
         let base_y = rect.top() + row_index as f32 * layout.row_height + layout.ruby_top;
         for token in &layout.tokens[range.clone()] {
-            let color = token_color(state, token);
+            let color = token_color(ui.visuals(), state, token);
             let base_rect = Rect::from_min_size(
                 Pos2::new(x, base_y),
                 egui::vec2(token.width, layout.base_size * 1.35),
             );
             if is_current_token(state, token) {
-                painter.rect_filled(base_rect, 0.0, Color32::from_rgb(100, 140, 190));
+                painter.rect_filled(base_rect, 0.0, current_token_background(ui.visuals()));
                 painter.line_segment(
                     [
                         Pos2::new(base_rect.left(), base_rect.bottom()),
                         Pos2::new(base_rect.right(), base_rect.bottom()),
                     ],
-                    Stroke::new(1.0, Color32::WHITE),
+                    Stroke::new(1.0, current_text_color(ui.visuals())),
                 );
             }
             if let Some(ruby) = &token.ruby {
@@ -321,7 +345,7 @@ fn paint_line(
                 );
             }
             painter.text(
-                Pos2::new(x, base_y),
+                Pos2::new(x + (token.width - token.base_width) * 0.5, base_y),
                 Align2::LEFT_TOP,
                 &token.base,
                 FontId::proportional(layout.base_size),
@@ -338,13 +362,52 @@ fn is_current_token(state: LineState, token: &ScriptToken) -> bool {
         if (token.char_start..token.char_start + token.char_count).contains(&current))
 }
 
-fn token_color(state: LineState, token: &ScriptToken) -> Color32 {
+fn token_color(visuals: &egui::Visuals, state: LineState, token: &ScriptToken) -> Color32 {
     match state {
-        LineState::Past => Color32::DARK_GRAY,
+        LineState::Past => visuals.weak_text_color(),
         LineState::Current {
             char: Some(current),
-        } if token.char_start < current => Color32::WHITE,
-        _ => Color32::WHITE,
+        } if token.char_start < current => current_text_color(visuals),
+        _ => visuals.text_color(),
+    }
+}
+
+fn luminance(color: Color32) -> f32 {
+    let linear = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+}
+
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+fn current_background(visuals: &egui::Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(50, 75, 105)
+    } else {
+        Color32::from_rgb(185, 215, 245)
+    }
+}
+fn current_token_background(visuals: &egui::Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(100, 140, 190)
+    } else {
+        Color32::from_rgb(50, 85, 125)
+    }
+}
+fn current_text_color(visuals: &egui::Visuals) -> Color32 {
+    let bg = current_token_background(visuals);
+    if contrast_ratio(Color32::WHITE, bg) >= contrast_ratio(Color32::BLACK, bg) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
     }
 }
 
@@ -373,5 +436,41 @@ mod tests {
             WrapToken::plain(20.0),
         ];
         assert_eq!(wrap_tokens(&tokens, 40.0), vec![0..3, 3..4]);
+    }
+
+    #[test]
+    fn current_and_normal_text_meet_contrast_in_light_and_dark_visuals() {
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            assert!(contrast_ratio(visuals.text_color(), visuals.panel_fill) >= 4.5);
+            assert!(
+                contrast_ratio(
+                    current_text_color(&visuals),
+                    current_token_background(&visuals)
+                ) >= 4.5
+            );
+        }
+    }
+
+    #[test]
+    fn cache_generation_discards_entries_when_width_changes() {
+        let mut cache = LayoutCache::default();
+        cache.width_bits = 600.0_f32.to_bits();
+        cache.entries.insert(
+            ("S01-L001:old".to_owned(), true),
+            Arc::new(LineLayout {
+                tokens: vec![],
+                rows: vec![],
+                height: 0.0,
+                base_size: 0.0,
+                ruby_size: 0.0,
+                ruby_top: 0.0,
+                row_height: 0.0,
+            }),
+        );
+        if cache.width_bits != 601.0_f32.to_bits() {
+            cache.width_bits = 601.0_f32.to_bits();
+            cache.entries.clear();
+        }
+        assert!(cache.entries.is_empty());
     }
 }
