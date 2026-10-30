@@ -125,6 +125,7 @@ impl App {
                 self.error = None;
                 self.meter_state.reset();
                 self.script_view_state.clear_selection();
+                self.script_view_state.clear_layout_cache();
                 self.last_seek_epoch = 0;
             }
             Err(error) => self.error = Some(error),

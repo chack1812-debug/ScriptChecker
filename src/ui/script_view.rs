@@ -15,8 +15,10 @@ use crate::{
 const SPEAKER_WIDTH: f32 = 90.0;
 const RUBY_SCALE: f32 = 0.55;
 const KINSOKU_LINE_START: &str = "、。，．）」』】!?！？";
+const AUTO_SCROLL_EDGE: f32 = 24.0;
+const AUTO_SCROLL_MAX_DELTA: f32 = 18.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum LineState {
     Past,
     Current { char: Option<usize> },
@@ -49,10 +51,6 @@ impl SelectionRange {
             }
         }
     }
-
-    fn is_empty(self) -> bool {
-        self.start == self.end
-    }
 }
 
 pub fn selection_text(lines: &[ScriptLine], selection: SelectionRange) -> String {
@@ -60,9 +58,6 @@ pub fn selection_text(lines: &[ScriptLine], selection: SelectionRange) -> String
 }
 
 fn selection_text_refs(lines: &[&ScriptLine], selection: SelectionRange) -> String {
-    if selection.is_empty() {
-        return String::new();
-    }
     lines
         .iter()
         .enumerate()
@@ -78,6 +73,9 @@ pub struct ScriptViewState {
     selection: Option<SelectionRange>,
     drag_start: Option<(SelectionPoint, Pos2)>,
     pressed_timeline: Option<Option<usize>>,
+    drag_exceeded_threshold: bool,
+    clear_layout_cache: bool,
+    scroll_offset_y: f32,
 }
 
 impl ScriptViewState {
@@ -89,6 +87,16 @@ impl ScriptViewState {
         self.selection = None;
         self.drag_start = None;
         self.pressed_timeline = None;
+        self.drag_exceeded_threshold = false;
+    }
+
+    pub fn clear_layout_cache(&mut self) {
+        self.clear_layout_cache = true;
+    }
+
+    #[cfg(test)]
+    fn scroll_offset_y(&self) -> f32 {
+        self.scroll_offset_y
     }
 }
 
@@ -131,7 +139,7 @@ fn selected_line_text(line: &ScriptLine, line_index: usize, selection: Selection
     if text.is_empty() {
         String::new()
     } else {
-        format!("[{}] {}: {text}", line.id, line.cast)
+        format!("[{}] {}:{text}", line.id, line.cast)
     }
 }
 
@@ -243,11 +251,28 @@ pub fn draw_script(
                 cache
             })
     });
+    if view_state.clear_layout_cache {
+        cache
+            .lock()
+            .expect("script layout cache poisoned")
+            .entries
+            .clear();
+        view_state.clear_layout_cache = false;
+    }
     let mut seek_to = None;
     let mut hit_lines = Vec::new();
     let mut line_index = 0;
-    egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+    let scroll_output = egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
         let viewport = viewport.translate(ui.min_rect().min.to_vec2());
+        if view_state.drag_start.is_some()
+            && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
+        {
+            let delta_y = auto_scroll_delta(ui.clip_rect(), pointer);
+            if delta_y != 0.0 {
+                ui.scroll_with_delta(egui::vec2(0.0, delta_y));
+                ui.ctx().request_repaint();
+            }
+        }
         for item in items {
             match item {
                 ScriptItem::Scene(SceneHead { id, name }) => {
@@ -338,39 +363,53 @@ pub fn draw_script(
             }
         }
     });
-    if ui
-        .ctx()
-        .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+    view_state.scroll_offset_y = scroll_output.state.offset.y;
+    let pointer_pos = ui.ctx().input(|input| input.pointer.interact_pos());
+    let pointer_is_on_script_layer =
+        pointer_pos.is_some_and(|pos| ui.ctx().layer_id_at(pos) == Some(ui.layer_id()));
+    if pointer_is_on_script_layer
+        && ui
+            .ctx()
+            .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
         && let Some(hit) = line_at_pointer(ui.ctx(), &hit_lines)
     {
         view_state.selection = None;
         view_state.drag_start = None;
         view_state.pressed_timeline = Some(hit.timeline_index);
-        if let Some((point, pointer)) = pointer_hit(ui.ctx(), &hit_lines) {
+        view_state.drag_exceeded_threshold = false;
+        if let Some((point, pointer)) = pointer_hit_or_line_start(ui.ctx(), &hit_lines) {
             view_state.drag_start = Some((point, pointer));
         }
     }
     if let Some((start, origin)) = view_state.drag_start
-        && let Some((end, pointer)) = pointer_hit(ui.ctx(), &hit_lines)
+        && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
         && pointer.distance(origin) >= 3.0
     {
-        view_state.selection = Some(SelectionRange::new(start, end));
+        view_state.drag_exceeded_threshold = true;
+        if let Some(end) = selection_point_at_or_nearest(&hit_lines, pointer) {
+            view_state.selection = Some(SelectionRange::new(start, end));
+        }
     }
     if ui
         .ctx()
         .input(|input| input.pointer.button_released(egui::PointerButton::Primary))
     {
         view_state.drag_start = None;
-        if view_state.selection.is_none()
+        if !view_state.drag_exceeded_threshold
+            && view_state.selection.is_none()
             && let Some(Some(index)) = view_state.pressed_timeline.take()
         {
             seek_to = Some(timeline.lines[index].start_ms);
         }
     }
-    if ui
-        .ctx()
-        .input(|input| input.modifiers.command && input.key_pressed(egui::Key::C))
-    {
+    let copy_requested = ui.ctx().input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Copy))
+            || (input.modifiers.command && input.key_pressed(egui::Key::C))
+    });
+    if copy_requested {
         copy_selection(ui.ctx(), items, view_state.selection);
     }
     seek_to
@@ -393,9 +432,41 @@ fn line_at_pointer<'a>(ctx: &egui::Context, hit_lines: &'a [HitLine]) -> Option<
     hit_lines.iter().find(|line| line.rect.contains(pointer))
 }
 
-fn pointer_hit(ctx: &egui::Context, hit_lines: &[HitLine]) -> Option<(SelectionPoint, Pos2)> {
+fn pointer_hit_or_line_start(
+    ctx: &egui::Context,
+    hit_lines: &[HitLine],
+) -> Option<(SelectionPoint, Pos2)> {
     let pointer = ctx.input(|input| input.pointer.interact_pos())?;
-    selection_point_at(hit_lines, pointer).map(|point| (point, pointer))
+    let point = selection_point_at(hit_lines, pointer).or_else(|| {
+        hit_lines
+            .iter()
+            .find(|line| line.rect.contains(pointer))
+            .and_then(|line| {
+                line.hits.first().map(|hit| SelectionPoint {
+                    line: line.line,
+                    character: hit.character,
+                })
+            })
+    })?;
+    Some((point, pointer))
+}
+
+fn selection_point_at_or_nearest(hit_lines: &[HitLine], pointer: Pos2) -> Option<SelectionPoint> {
+    selection_point_at(hit_lines, pointer).or_else(|| {
+        hit_lines
+            .iter()
+            .flat_map(|line| line.hits.iter().map(move |hit| (line.line, hit)))
+            .min_by(|(_, left), (_, right)| {
+                left.rect
+                    .center()
+                    .distance_sq(pointer)
+                    .total_cmp(&right.rect.center().distance_sq(pointer))
+            })
+            .map(|(line, hit)| SelectionPoint {
+                line,
+                character: hit.character,
+            })
+    })
 }
 
 fn selection_point_at(hit_lines: &[HitLine], pointer: Pos2) -> Option<SelectionPoint> {
@@ -448,6 +519,21 @@ fn line_state(
 
 fn content_width(ui: &egui::Ui) -> f32 {
     (ui.available_width() - SPEAKER_WIDTH).max(1.0)
+}
+
+/// Negative values move the scroll area's content up, i.e. scroll downward.
+fn auto_scroll_delta(viewport: Rect, pointer: Pos2) -> f32 {
+    let edge_speed = |distance_from_edge: f32| {
+        ((AUTO_SCROLL_EDGE - distance_from_edge) / AUTO_SCROLL_EDGE).clamp(0.0, 1.0)
+            * AUTO_SCROLL_MAX_DELTA
+    };
+    if pointer.y < viewport.top() + AUTO_SCROLL_EDGE {
+        edge_speed(pointer.y - viewport.top())
+    } else if pointer.y > viewport.bottom() - AUTO_SCROLL_EDGE {
+        -edge_speed(viewport.bottom() - pointer.y)
+    } else {
+        0.0
+    }
 }
 
 fn build_layout(ui: &egui::Ui, line: &ScriptLine, max_width: f32, show_ruby: bool) -> LineLayout {
@@ -551,19 +637,24 @@ fn paint_line(
         Align2::LEFT_TOP,
         format!("{}:", line.cast),
         FontId::proportional(layout.base_size),
-        ui.visuals().strong_text_color(),
+        readable_text_color(if matches!(state, LineState::Current { .. }) {
+            current_background(ui.visuals())
+        } else {
+            ui.visuals().panel_fill
+        }),
     );
     let mut hits = Vec::new();
     for (row_index, range) in layout.rows.iter().enumerate() {
         let mut x = rect.left() + SPEAKER_WIDTH;
         let base_y = rect.top() + row_index as f32 * layout.row_height + layout.ruby_top;
         for token in &layout.tokens[range.clone()] {
-            let color = token_color(ui.visuals(), state, token);
+            let selected = token_is_selected(selection, line_index, token);
+            let color = token_color(ui.visuals(), state, token, selected);
             let base_rect = Rect::from_min_size(
                 Pos2::new(x, base_y),
                 egui::vec2(token.width, layout.base_size * 1.35),
             );
-            if token_is_selected(selection, line_index, token) {
+            if selected {
                 painter.rect_filled(base_rect, 0.0, selection_background(ui.visuals()));
             }
             if is_current_token(state, token) {
@@ -634,13 +725,16 @@ fn is_current_token(state: LineState, token: &ScriptToken) -> bool {
         if (token.char_start..token.char_start + token.char_count).contains(&current))
 }
 
-fn token_color(visuals: &egui::Visuals, state: LineState, token: &ScriptToken) -> Color32 {
+fn token_color(
+    visuals: &egui::Visuals,
+    state: LineState,
+    token: &ScriptToken,
+    selected: bool,
+) -> Color32 {
+    let background = token_background(visuals, state, token, selected);
     match state {
-        LineState::Past => visuals.weak_text_color(),
-        LineState::Current {
-            char: Some(current),
-        } if token.char_start < current => current_text_color(visuals),
-        _ => visuals.text_color(),
+        LineState::Past => past_text_color(visuals, background),
+        _ => readable_text_color(background),
     }
 }
 
@@ -682,11 +776,44 @@ fn selection_background(visuals: &egui::Visuals) -> Color32 {
     }
 }
 fn current_text_color(visuals: &egui::Visuals) -> Color32 {
-    let bg = current_token_background(visuals);
-    if contrast_ratio(Color32::WHITE, bg) >= contrast_ratio(Color32::BLACK, bg) {
+    readable_text_color(current_token_background(visuals))
+}
+
+fn readable_text_color(background: Color32) -> Color32 {
+    if contrast_ratio(Color32::WHITE, background) >= contrast_ratio(Color32::BLACK, background) {
         Color32::WHITE
     } else {
         Color32::BLACK
+    }
+}
+
+fn past_text_color(visuals: &egui::Visuals, background: Color32) -> Color32 {
+    let preferred = if visuals.dark_mode {
+        Color32::from_gray(225)
+    } else {
+        Color32::from_gray(70)
+    };
+    if contrast_ratio(preferred, background) >= 4.5 {
+        preferred
+    } else {
+        readable_text_color(background)
+    }
+}
+
+fn token_background(
+    visuals: &egui::Visuals,
+    state: LineState,
+    token: &ScriptToken,
+    selected: bool,
+) -> Color32 {
+    if is_current_token(state, token) {
+        current_token_background(visuals)
+    } else if selected {
+        selection_background(visuals)
+    } else if matches!(state, LineState::Current { .. }) {
+        current_background(visuals)
+    } else {
+        visuals.panel_fill
     }
 }
 
@@ -732,19 +859,19 @@ mod tests {
         );
         assert_eq!(
             selection_text(&selection_lines(), selection),
-            "[S01-L001] 蒼真: '東京|とうきょう'後\n[S01-L002] 大和: 次の行"
+            "[S01-L001] 蒼真:'東京|とうきょう'後\n[S01-L002] 大和:次の行"
         );
     }
 
     #[test]
-    fn empty_selection_has_no_copyable_text() {
+    fn single_character_selection_is_copyable() {
         let point = SelectionPoint {
             line: 0,
             character: 1,
         };
         assert_eq!(
             selection_text(&selection_lines(), SelectionRange::new(point, point)),
-            ""
+            "[S01-L001] 蒼真:'東京|とうきょう'"
         );
     }
 
@@ -773,6 +900,18 @@ mod tests {
             })
         );
         assert_eq!(selection_point_at(&hits, Pos2::new(21.0, 5.0)), None);
+    }
+
+    #[test]
+    fn auto_scroll_delta_accelerates_only_inside_viewport_edges() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 120.0));
+        assert_eq!(auto_scroll_delta(viewport, Pos2::new(100.0, 60.0)), 0.0);
+        assert!(auto_scroll_delta(viewport, Pos2::new(100.0, 4.0)) > 0.0);
+        assert!(auto_scroll_delta(viewport, Pos2::new(100.0, 116.0)) < 0.0);
+        assert!(
+            auto_scroll_delta(viewport, Pos2::new(100.0, 119.0)).abs()
+                > auto_scroll_delta(viewport, Pos2::new(100.0, 110.0)).abs()
+        );
     }
 
     fn selection_timeline() -> Timeline {
@@ -861,6 +1000,62 @@ mod tests {
             collect(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    fn drawn_text_rect(shapes: &[egui::epaint::ClippedShape], wanted: &str) -> Option<Rect> {
+        fn find(shape: &egui::epaint::Shape, wanted: &str) -> Option<Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == wanted => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| find(shape, wanted))
+                }
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape, wanted))
+    }
+
+    fn text_shape_and_smallest_background(
+        shapes: &[egui::epaint::ClippedShape],
+        wanted: &str,
+    ) -> Option<(Color32, Color32)> {
+        fn collect(
+            shape: &egui::epaint::Shape,
+            wanted: &str,
+            text: &mut Option<(Rect, Color32)>,
+            backgrounds: &mut Vec<(Rect, Color32)>,
+        ) {
+            match shape {
+                egui::epaint::Shape::Text(value) if value.galley.job.text == wanted => {
+                    *text = Some((
+                        value.galley.rect.translate(value.pos.to_vec2()),
+                        value.override_text_color.unwrap_or(value.fallback_color),
+                    ));
+                }
+                egui::epaint::Shape::Rect(value) => backgrounds.push((value.rect, value.fill)),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, wanted, text, backgrounds);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = None;
+        let mut backgrounds = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, wanted, &mut text, &mut backgrounds);
+        }
+        let (text_rect, text_color) = text?;
+        backgrounds
+            .into_iter()
+            .filter(|(rect, _)| rect.contains_rect(text_rect))
+            .min_by(|(left, _), (right, _)| left.area().total_cmp(&right.area()))
+            .map(|(_, background)| (text_color, background))
     }
 
     fn draw_visual_frame(
@@ -1121,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_drag_selection_copies_text_with_ctrl_c() {
+    fn headless_drag_selection_copies_text_with_event_copy() {
         let ctx = egui::Context::default();
         let items = vec![ScriptItem::Line(ScriptLine {
             id: "S01-L001".to_owned(),
@@ -1156,15 +1351,7 @@ mod tests {
         }
 
         assert!(state.selection().is_some());
-        let mut copy_input = selection_input(vec![egui::Event::Key {
-            key: egui::Key::C,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::COMMAND,
-        }]);
-        copy_input.modifiers = egui::Modifiers::COMMAND;
-        let output = ctx.run(copy_input, |ctx| {
+        let output = ctx.run(selection_input(vec![egui::Event::Copy]), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
             });
@@ -1177,18 +1364,358 @@ mod tests {
                 egui::OutputCommand::CopyText(text) => Some(text),
                 _ => None,
             })
-            .expect("Ctrl+C must emit a copy command");
-        assert_eq!(
-            copied,
-            &selection_text(
-                &[match &items[0] {
-                    ScriptItem::Line(line) => line.clone(),
-                    ScriptItem::Scene(_) => unreachable!(),
-                }],
-                state.selection().expect("drag must select text")
-            )
+            .expect("Event::Copy must emit a copy command");
+        assert_eq!(copied, "[S01-L001] 蒼真:abcd");
+    }
+
+    #[test]
+    fn headless_short_drag_inside_one_plain_token_copies_that_character() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("あいう".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+        for events in [
+            vec![],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(100.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(Pos2::new(104.0, 15.0))],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(104.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = draw_visual_frame(&ctx, &items, &timeline, 0, false, events, &mut state);
+        }
+        let output = draw_visual_frame(
+            &ctx,
+            &items,
+            &timeline,
+            0,
+            false,
+            vec![egui::Event::Copy],
+            &mut state,
         );
-        assert!(copied.starts_with("[S01-L001] 蒼真: "));
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            });
+        assert_eq!(copied, Some("[S01-L001] 蒼真:あ"));
+    }
+
+    #[test]
+    fn headless_short_drag_inside_ruby_token_copies_the_whole_ruby_word() {
+        let ctx = egui::Context::default();
+        let items = selection_lines()
+            .into_iter()
+            .take(1)
+            .map(ScriptItem::Line)
+            .collect::<Vec<_>>();
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+        for events in [
+            vec![],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(115.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(Pos2::new(119.0, 15.0))],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(119.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = draw_visual_frame(&ctx, &items, &timeline, 0, false, events, &mut state);
+        }
+        let output = draw_visual_frame(
+            &ctx,
+            &items,
+            &timeline,
+            0,
+            false,
+            vec![egui::Event::Copy],
+            &mut state,
+        );
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            });
+        assert_eq!(copied, Some("[S01-L001] 蒼真:'東京|とうきょう'"));
+    }
+
+    #[test]
+    fn headless_context_menu_copy_keeps_selection_and_does_not_seek() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("abcdef".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+        let mut seek_to = None;
+        for events in [
+            vec![],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(104.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(Pos2::new(124.0, 15.0))],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(124.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(124.0, 15.0),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(124.0, 15.0),
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = ctx.run(selection_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                });
+            });
+        }
+        let menu = ctx.run(selection_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+            });
+        });
+        let menu_pos = drawn_text_rect(&menu.shapes, "コピー")
+            .expect("context menu must render the copy button")
+            .center();
+        let _ = ctx.run(
+            selection_input(vec![egui::Event::PointerButton {
+                pos: menu_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                });
+            },
+        );
+        let output = ctx.run(
+            selection_input(vec![egui::Event::PointerButton {
+                pos: menu_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                });
+            },
+        );
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            });
+        assert_eq!(copied, Some("[S01-L001] 蒼真:abcd".to_owned()));
+        assert!(state.selection().is_some());
+        assert_eq!(seek_to, None);
+
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                selection_input(vec![egui::Event::PointerButton {
+                    pos: Pos2::new(124.0, 15.0),
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                    });
+                },
+            );
+        }
+        let menu = ctx.run(selection_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+            });
+        });
+        let line_copy_pos = drawn_text_rect(&menu.shapes, "この行をコピー")
+            .expect("context menu must render the line-copy button")
+            .center();
+        for pressed in [true, false] {
+            let output = ctx.run(
+                selection_input(vec![egui::Event::PointerButton {
+                    pos: line_copy_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                    });
+                },
+            );
+            if !pressed {
+                let copied =
+                    output
+                        .platform_output
+                        .commands
+                        .iter()
+                        .find_map(|command| match command {
+                            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                            _ => None,
+                        });
+                assert_eq!(copied, Some("[S01-L001] 蒼真:abcdef".to_owned()));
+            }
+        }
+        assert!(state.selection().is_some());
+        assert_eq!(seek_to, None);
+    }
+
+    #[test]
+    fn headless_drag_at_lower_edge_scrolls_and_extends_selection() {
+        let ctx = egui::Context::default();
+        let items = visual_items(80);
+        let timeline = visual_timeline(&items);
+        let mut state = ScriptViewState::default();
+        let _ = draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state);
+        let _ = draw_visual_frame(
+            &ctx,
+            &items,
+            &timeline,
+            0,
+            false,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(105.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        for _ in 0..30 {
+            let _ = draw_visual_frame(
+                &ctx,
+                &items,
+                &timeline,
+                0,
+                false,
+                vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
+                &mut state,
+            );
+        }
+        assert!(state.scroll_offset_y() > 0.0);
+        assert!(
+            state
+                .selection()
+                .is_some_and(|selection| selection.end.line > 0)
+        );
+    }
+
+    #[test]
+    fn headless_current_token_uses_a_contrasting_text_shape_over_its_real_fill() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("abc".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+        let output = draw_visual_frame(&ctx, &items, &timeline, 100, false, vec![], &mut state);
+        let (text, background) = text_shape_and_smallest_background(&output.shapes, "a")
+            .expect("the current token and its fill must be drawn");
+        assert!(contrast_ratio(text, background) >= 4.5);
+    }
+
+    #[test]
+    fn headless_drag_from_speaker_or_past_text_tail_selects_without_seeking() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("abcdef".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+        let mut seek_to = None;
+        for events in [
+            vec![],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(20.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(Pos2::new(290.0, 15.0))],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(290.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = ctx.run(selection_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                });
+            });
+        }
+        assert_eq!(
+            state.selection(),
+            Some(SelectionRange::new(
+                SelectionPoint {
+                    line: 0,
+                    character: 0
+                },
+                SelectionPoint {
+                    line: 0,
+                    character: 5
+                },
+            ))
+        );
+        assert_eq!(seek_to, None);
     }
 
     #[test]
@@ -1263,15 +1790,36 @@ mod tests {
     }
 
     #[test]
-    fn current_and_normal_text_meet_contrast_in_light_and_dark_visuals() {
+    fn every_drawn_script_text_colour_meets_wcag_contrast_in_both_themes() {
+        let token = ScriptToken {
+            base: "文".to_owned(),
+            ruby: None,
+            width: 10.0,
+            ruby_width: 0.0,
+            base_width: 10.0,
+            char_start: 0,
+            char_count: 1,
+            prohibit_line_start: false,
+        };
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
-            assert!(contrast_ratio(visuals.text_color(), visuals.panel_fill) >= 4.5);
-            assert!(
-                contrast_ratio(
-                    current_text_color(&visuals),
-                    current_token_background(&visuals)
-                ) >= 4.5
-            );
+            for state in [
+                LineState::Past,
+                LineState::Current { char: None },
+                LineState::Current { char: Some(0) },
+                LineState::Future,
+            ] {
+                for selected in [false, true] {
+                    let background = token_background(&visuals, state, &token, selected);
+                    assert!(
+                        contrast_ratio(token_color(&visuals, state, &token, selected), background)
+                            >= 4.5,
+                        "state={state:?}, selected={selected}"
+                    );
+                }
+            }
+            for background in [visuals.panel_fill, current_background(&visuals)] {
+                assert!(contrast_ratio(readable_text_color(background), background) >= 4.5);
+            }
         }
     }
 
