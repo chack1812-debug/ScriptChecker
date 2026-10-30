@@ -1,0 +1,1 @@
+//! ScriptChecker のライブラリ層。
