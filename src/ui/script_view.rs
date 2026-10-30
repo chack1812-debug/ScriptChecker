@@ -826,6 +826,25 @@ mod tests {
         shapes.iter().map(|clipped| count(&clipped.shape)).sum()
     }
 
+    fn drawn_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn collect(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
     fn draw_visual_frame(
         ctx: &egui::Context,
         items: &[ScriptItem],
@@ -893,6 +912,47 @@ mod tests {
                 "{name} viewport must paint text"
             );
         }
+    }
+
+    #[test]
+    fn headless_redraw_replaces_cached_text_when_same_line_id_changes() {
+        let ctx = egui::Context::default();
+        let mut state = ScriptViewState::default();
+        let old_items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("旧本文".to_owned())],
+        })];
+        let new_items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("新本文".to_owned())],
+        })];
+        let old_timeline = visual_timeline(&old_items);
+        let new_timeline = visual_timeline(&new_items);
+        let old = draw_visual_frame(
+            &ctx,
+            &old_items,
+            &old_timeline,
+            0,
+            false,
+            vec![],
+            &mut state,
+        );
+        let new = draw_visual_frame(
+            &ctx,
+            &new_items,
+            &new_timeline,
+            0,
+            false,
+            vec![],
+            &mut state,
+        );
+        assert!(drawn_texts(&old.shapes).iter().any(|text| text == "旧"));
+        assert!(drawn_texts(&new.shapes).iter().any(|text| text == "新"));
+        assert!(!drawn_texts(&new.shapes).iter().any(|text| text == "旧"));
     }
 
     #[test]
