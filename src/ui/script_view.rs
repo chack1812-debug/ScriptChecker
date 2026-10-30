@@ -77,6 +77,7 @@ fn selection_text_refs(lines: &[&ScriptLine], selection: SelectionRange) -> Stri
 pub struct ScriptViewState {
     selection: Option<SelectionRange>,
     drag_start: Option<(SelectionPoint, Pos2)>,
+    pressed_timeline: Option<Option<usize>>,
 }
 
 impl ScriptViewState {
@@ -87,6 +88,7 @@ impl ScriptViewState {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.drag_start = None;
+        self.pressed_timeline = None;
     }
 }
 
@@ -280,7 +282,7 @@ pub fn draw_script(
                         ui.cursor().min,
                         egui::vec2(ui.available_width(), layout.height),
                     );
-                    let response = if next_rect.intersects(viewport) {
+                    let (response, hits) = if next_rect.intersects(viewport) {
                         let (response, hits) = paint_line(
                             ui,
                             line,
@@ -289,15 +291,19 @@ pub fn draw_script(
                             view_state.selection,
                             this_line_index,
                         );
-                        hit_lines.push(HitLine {
-                            line: this_line_index,
-                            timeline_index,
-                            hits,
-                        });
-                        response
+                        (response, hits)
                     } else {
-                        ui.allocate_rect(next_rect, Sense::click_and_drag())
+                        (
+                            ui.allocate_rect(next_rect, Sense::click_and_drag()),
+                            Vec::new(),
+                        )
                     };
+                    hit_lines.push(HitLine {
+                        line: this_line_index,
+                        timeline_index,
+                        rect: response.rect,
+                        hits,
+                    });
                     response.context_menu(|ui| {
                         if ui.button("コピー").clicked() {
                             copy_selection(ui.ctx(), items, view_state.selection);
@@ -332,13 +338,17 @@ pub fn draw_script(
             }
         }
     });
-    if let Some((point, pointer)) = pointer_hit(ui.ctx(), &hit_lines)
-        && ui
-            .ctx()
-            .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+    if ui
+        .ctx()
+        .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+        && let Some(hit) = line_at_pointer(ui.ctx(), &hit_lines)
     {
-        view_state.drag_start = Some((point, pointer));
         view_state.selection = None;
+        view_state.drag_start = None;
+        view_state.pressed_timeline = Some(hit.timeline_index);
+        if let Some((point, pointer)) = pointer_hit(ui.ctx(), &hit_lines) {
+            view_state.drag_start = Some((point, pointer));
+        }
     }
     if let Some((start, origin)) = view_state.drag_start
         && let Some((end, pointer)) = pointer_hit(ui.ctx(), &hit_lines)
@@ -349,12 +359,13 @@ pub fn draw_script(
     if ui
         .ctx()
         .input(|input| input.pointer.button_released(egui::PointerButton::Primary))
-        && let Some((start, _)) = view_state.drag_start.take()
-        && view_state.selection.is_none()
-        && let Some(hit) = hit_lines.iter().find(|line| line.line == start.line)
-        && let Some(index) = hit.timeline_index
     {
-        seek_to = Some(timeline.lines[index].start_ms);
+        view_state.drag_start = None;
+        if view_state.selection.is_none()
+            && let Some(Some(index)) = view_state.pressed_timeline.take()
+        {
+            seek_to = Some(timeline.lines[index].start_ms);
+        }
     }
     if ui
         .ctx()
@@ -373,7 +384,13 @@ struct HitToken {
 struct HitLine {
     line: usize,
     timeline_index: Option<usize>,
+    rect: Rect,
     hits: Vec<HitToken>,
+}
+
+fn line_at_pointer<'a>(ctx: &egui::Context, hit_lines: &'a [HitLine]) -> Option<&'a HitLine> {
+    let pointer = ctx.input(|input| input.pointer.interact_pos())?;
+    hit_lines.iter().find(|line| line.rect.contains(pointer))
 }
 
 fn pointer_hit(ctx: &egui::Context, hit_lines: &[HitLine]) -> Option<(SelectionPoint, Pos2)> {
@@ -736,6 +753,7 @@ mod tests {
         let hits = [HitLine {
             line: 3,
             timeline_index: None,
+            rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(20.0, 10.0)),
             hits: vec![
                 HitToken {
                     rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(10.0, 10.0)),
@@ -1171,6 +1189,54 @@ mod tests {
             )
         );
         assert!(copied.starts_with("[S01-L001] 蒼真: "));
+    }
+
+    #[test]
+    fn clicking_line_margin_clears_selection_and_seeks() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("abcdef".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState {
+            selection: Some(SelectionRange::new(
+                SelectionPoint {
+                    line: 0,
+                    character: 0,
+                },
+                SelectionPoint {
+                    line: 0,
+                    character: 2,
+                },
+            )),
+            ..Default::default()
+        };
+        let mut seek_to = None;
+        for events in [
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(20.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(20.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = ctx.run(selection_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                });
+            });
+        }
+        assert_eq!(state.selection(), None);
+        assert_eq!(seek_to, Some(0));
     }
 
     #[test]
