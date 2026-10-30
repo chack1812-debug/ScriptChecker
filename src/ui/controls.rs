@@ -51,13 +51,20 @@ pub fn draw_controls(
             }
         });
 
-        let (seek_command, _) = draw_seek_row(ui, state.position_ms, total_ms);
-        command = command.or(seek_command);
+        command = command.or(draw_seek_row(ui, state.position_ms, total_ms));
     });
     command
 }
 
 fn draw_seek_row(
+    ui: &mut egui::Ui,
+    initial_position: u64,
+    total_ms: u64,
+) -> Option<ControlCommand> {
+    draw_seek_row_with_width(ui, initial_position, total_ms).0
+}
+
+fn draw_seek_row_with_width(
     ui: &mut egui::Ui,
     initial_position: u64,
     total_ms: u64,
@@ -104,6 +111,15 @@ fn draw_seek_row(
         ui.label(right);
     });
     (command, drawn_width)
+}
+
+#[cfg(test)]
+fn draw_seek_row_for_test(
+    ui: &mut egui::Ui,
+    initial_position: u64,
+    total_ms: u64,
+) -> (Option<ControlCommand>, f32) {
+    draw_seek_row_with_width(ui, initial_position, total_ms)
 }
 
 pub fn slider_width(
@@ -197,7 +213,7 @@ mod tests {
                             right_width,
                             ui.spacing().item_spacing.x,
                         );
-                        let (_, actual) = draw_seek_row(ui, 0, 60_000);
+                        let (_, actual) = draw_seek_row_for_test(ui, 0, 60_000);
                         assert!(
                             (actual - expected).abs() < 0.01,
                             "width={width}: {actual} != {expected}"

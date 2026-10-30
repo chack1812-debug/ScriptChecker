@@ -5,6 +5,7 @@ use crate::meter::MeterFrame;
 pub const METER_WINDOW_S: f32 = 0.05;
 pub const METER_PANEL_WIDTH: f32 = 136.0;
 pub const NUMERIC_DISPLAY_INTERVAL_S: f64 = 0.05;
+const TICK_LABEL_PADDING: f32 = 6.0;
 
 #[derive(Default)]
 pub struct MeterViewState {
@@ -80,7 +81,10 @@ fn meter_layout(available: Rect) -> MeterLayout {
         Pos2::new(rect.left(), rect.bottom() - number_height),
         rect.right_bottom(),
     );
-    let bar_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right(), number_rect.top()));
+    let bar_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.top() + TICK_LABEL_PADDING),
+        Pos2::new(rect.right(), number_rect.top() - TICK_LABEL_PADDING),
+    );
     MeterLayout {
         rect,
         bar_rect,
@@ -113,34 +117,41 @@ pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFr
     let _ = draw_meter_with_report(ui, state, meter, now_s);
 }
 
+#[allow(dead_code)] // Production ignores this test-only rendering report.
+struct MeterDrawReport {
+    numeric_text_rects: Vec<Rect>,
+    tick_text_rects: Vec<Rect>,
+    number_rect: Rect,
+    outer_rect: Rect,
+}
+
 fn draw_meter_with_report(
     ui: &mut egui::Ui,
     state: &mut MeterViewState,
     meter: &MeterFrame,
     now_s: f64,
-) -> (Vec<Rect>, Rect) {
+) -> MeterDrawReport {
     state.update_numeric_display(meter, now_s);
     let height = ui.available_height().max(120.0);
     let available = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), height));
     let layout = meter_layout(available);
     let (rect, _) = ui.allocate_exact_size(layout.rect.size(), egui::Sense::hover());
-    let bar_rect = Rect::from_min_size(rect.min, layout.bar_rect.size());
-    let number_rect = Rect::from_min_size(
-        Pos2::new(rect.left(), rect.bottom() - layout.number_rect.height()),
-        layout.number_rect.size(),
-    );
+    let offset = rect.min - layout.rect.min;
+    let bar_rect = layout.bar_rect.translate(offset);
+    let number_rect = layout.number_rect.translate(offset);
     let painter = ui.painter_at(rect);
     let tick_width = 32.0;
     let bar_width = ((bar_rect.width() - tick_width) / 2.0).max(0.0);
+    let mut tick_text_rects = Vec::new();
     for dbfs in [-60.0, -48.0, -36.0, -24.0, -12.0, 0.0] {
         let y = bar_rect.bottom() - meter_y_fraction(dbfs) * bar_rect.height();
-        painter.text(
+        tick_text_rects.push(painter.text(
             Pos2::new(rect.left(), y),
             Align2::LEFT_CENTER,
             format!("{dbfs:.0}"),
             FontId::proportional(9.0),
             ui.visuals().weak_text_color(),
-        );
+        ));
         painter.line_segment(
             [
                 Pos2::new(rect.left() + tick_width, y),
@@ -206,7 +217,12 @@ fn draw_meter_with_report(
             text_rects.push(text_rect);
         }
     }
-    (text_rects, number_rect)
+    MeterDrawReport {
+        numeric_text_rects: text_rects,
+        tick_text_rects,
+        number_rect,
+        outer_rect: rect,
+    }
 }
 
 fn draw_line(painter: &egui::Painter, bar: Rect, dbfs: f32, color: Color32) {
@@ -281,7 +297,8 @@ mod tests {
         assert!(layout.rect.width() <= outer.width());
         assert!(outer.contains_rect(layout.bar_rect));
         assert!(outer.contains_rect(layout.number_rect));
-        assert_eq!(layout.bar_rect.bottom(), layout.number_rect.top());
+        assert!(layout.bar_rect.bottom() < layout.number_rect.top());
+        assert!(layout.bar_rect.top() > layout.rect.top());
     }
 
     #[test]
@@ -322,13 +339,20 @@ mod tests {
                             },
                         ],
                     };
-                    let (text_rects, number_rect) =
-                        draw_meter_with_report(ui, &mut state, &meter, 0.0);
-                    assert_eq!(text_rects.len(), 9);
+                    let report = draw_meter_with_report(ui, &mut state, &meter, 0.0);
+                    assert_eq!(report.numeric_text_rects.len(), 9);
                     assert!(
-                        text_rects
+                        report
+                            .numeric_text_rects
                             .iter()
-                            .all(|rect| number_rect.contains_rect(*rect))
+                            .all(|rect| report.number_rect.contains_rect(*rect))
+                    );
+                    assert_eq!(report.tick_text_rects.len(), 6);
+                    assert!(
+                        report
+                            .tick_text_rects
+                            .iter()
+                            .all(|rect| report.outer_rect.contains_rect(*rect))
                     );
                     let bar = Rect::from_min_max(Pos2::new(32.0, 0.0), Pos2::new(84.0, 100.0));
                     assert_eq!(
