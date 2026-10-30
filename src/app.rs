@@ -6,15 +6,15 @@ use std::{
 use eframe::egui;
 
 use crate::{
-    audio::{load_wav, AudioData},
-    output::{start_output, Output},
+    audio::{AudioData, load_wav},
     meter::analyze_meter,
-    script::{parse_script, ScriptItem},
-    timeline::{check_consistency, parse_timeline, Timeline, Warnings},
+    output::{Output, start_output},
+    script::{ScriptItem, parse_script},
+    timeline::{Timeline, Warnings, check_consistency, parse_timeline},
     transport::{Mode, Transport},
     ui::{
-        controls::draw_controls,
-        meter_view::{draw_meter, MeterViewState, METER_WINDOW_S},
+        controls::{ControlState, apply_command, draw_controls},
+        meter_view::{METER_WINDOW_S, MeterViewState, draw_meter},
         script_view::draw_script,
     },
 };
@@ -30,14 +30,22 @@ pub struct Project {
 pub fn load_project(script_path: &Path) -> Result<Project, String> {
     let script_bytes = std::fs::read(script_path)
         .map_err(|error| format!("台本を読み取れません {}: {error}", script_path.display()))?;
-    let script_text = std::str::from_utf8(&script_bytes)
-        .map_err(|error| format!("台本は UTF-8 ではありません {}: {error}", script_path.display()))?;
+    let script_text = std::str::from_utf8(&script_bytes).map_err(|error| {
+        format!(
+            "台本は UTF-8 ではありません {}: {error}",
+            script_path.display()
+        )
+    })?;
     let parent = script_path
         .parent()
         .ok_or_else(|| format!("台本の親フォルダを取得できません {}", script_path.display()))?;
     let timeline_path = parent.join("timeline").join("timeline.json");
-    let timeline_json = std::fs::read_to_string(&timeline_path)
-        .map_err(|error| format!("timeline.json を読み取れません {}: {error}", timeline_path.display()))?;
+    let timeline_json = std::fs::read_to_string(&timeline_path).map_err(|error| {
+        format!(
+            "timeline.json を読み取れません {}: {error}",
+            timeline_path.display()
+        )
+    })?;
     let timeline = parse_timeline(&timeline_json)?;
     let audio_path = parent.join("full_dialogue.wav");
     let audio = load_wav(&audio_path)?;
@@ -66,6 +74,7 @@ pub struct App {
     follow: bool,
     show_ruby: bool,
     error: Option<String>,
+    output_error: Option<String>,
     meter_state: MeterViewState,
     last_seek_epoch: u64,
 }
@@ -79,6 +88,7 @@ impl App {
             follow: true,
             show_ruby: true,
             error: None,
+            output_error: None,
             meter_state: MeterViewState::default(),
             last_seek_epoch: 0,
         };
@@ -95,7 +105,7 @@ impl App {
                     project.audio.frame_count(),
                     project.audio.sample_rate,
                 )));
-                match start_output(
+                let (output, output_error) = match start_output(
                     AudioData {
                         sample_rate: project.audio.sample_rate,
                         channels: project.audio.channels,
@@ -103,16 +113,16 @@ impl App {
                     },
                     Arc::clone(&transport),
                 ) {
-                    Ok(output) => {
-                        self.project = Some(project);
-                        self.transport = transport;
-                        self.output = Some(output);
-                        self.error = None;
-                        self.meter_state.reset();
-                        self.last_seek_epoch = 0;
-                    }
-                    Err(error) => self.error = Some(error),
-                }
+                    Ok(output) => (Some(output), None),
+                    Err(error) => (None, Some(error)),
+                };
+                self.project = Some(project);
+                self.transport = transport;
+                self.output = output;
+                self.output_error = output_error;
+                self.error = None;
+                self.meter_state.reset();
+                self.last_seek_epoch = 0;
             }
             Err(error) => self.error = Some(error),
         }
@@ -125,11 +135,15 @@ impl eframe::App for App {
             if let Ok(mut transport) = self.transport.lock() {
                 transport.set_mode(Mode::Stopped);
             }
-            self.error = Some(format!("出力デバイスエラー: {message}"));
+            self.output_error = Some(format!("出力デバイスエラー: {message}"));
         }
+        let output_view = project_view_state(self.output_error.as_deref());
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::RED, error);
+            }
+            if let Some(error) = &output_view.output_error {
+                ui.colored_label(egui::Color32::RED, format!("出力エラー: {error}"));
             }
             if let Some(project) = &self.project {
                 let missing_count = project
@@ -167,10 +181,27 @@ impl eframe::App for App {
         });
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
-            if let Some(project) = &self.project
-                && let Ok(mut transport) = self.transport.lock()
-            {
-                draw_controls(ui, &mut transport, project.audio.duration_ms());
+            if let Some(project) = &self.project {
+                let state = self
+                    .transport
+                    .lock()
+                    .map(|transport| ControlState {
+                        position_ms: transport.position_ms(),
+                        mode: transport.mode(),
+                    })
+                    .unwrap_or(ControlState {
+                        position_ms: 0,
+                        mode: Mode::Stopped,
+                    });
+                if let Some(command) = draw_controls(
+                    ui,
+                    state,
+                    project.audio.duration_ms(),
+                    self.output.is_some() && output_view.playback_enabled,
+                ) && let Ok(mut transport) = self.transport.lock()
+                {
+                    apply_command(&mut transport, command);
+                }
             }
         });
         egui::SidePanel::right("meter")
@@ -240,25 +271,88 @@ fn is_line_availability_warning(warning: &str) -> bool {
     warning.contains("timeline.json にありません") || warning.contains("missing:true")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProjectViewState {
+    show_project: bool,
+    playback_enabled: bool,
+    output_error: Option<String>,
+}
+
+fn project_view_state(output_error: Option<&str>) -> ProjectViewState {
+    match output_error {
+        None => ProjectViewState {
+            show_project: true,
+            playback_enabled: true,
+            output_error: None,
+        },
+        Some(error) => ProjectViewState {
+            show_project: true,
+            playback_enabled: false,
+            output_error: Some(error.to_owned()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hound::{SampleFormat, WavSpec, WavWriter};
 
     fn temp_project(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("scriptchecker-project-{name}-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "scriptchecker-project-{name}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(path.join("timeline")).expect("create project directory");
         path
     }
 
     #[test]
     fn reports_full_paths_for_missing_project_files() {
-        let missing_script = std::env::temp_dir().join("scriptchecker-no-such-project").join("第1回.txt");
-        let error = match load_project(&missing_script) {
+        let project_dir = temp_project("missing-timeline");
+        let script_path = project_dir.join("第1回.txt");
+        std::fs::write(&script_path, "[S01-L001] 蒼真:こんにちは\n").expect("write script");
+        let error = match load_project(&script_path) {
             Err(error) => error,
-            Ok(_) => panic!("missing project must fail"),
+            Ok(_) => panic!("missing timeline must fail"),
         };
-        assert!(error.contains("timeline.json") || error.contains("full_dialogue.wav") || error.contains("第1回.txt"));
+        assert!(
+            error.contains(
+                &project_dir
+                    .join("timeline")
+                    .join("timeline.json")
+                    .display()
+                    .to_string()
+            )
+        );
+        std::fs::remove_dir_all(project_dir).expect("remove project directory");
+
+        let project_dir = temp_project("missing-audio");
+        let script_path = project_dir.join("第1回.txt");
+        let script = "[S01-L001] 蒼真:こんにちは\n";
+        std::fs::write(&script_path, script).expect("write script");
+        std::fs::write(
+            project_dir.join("timeline").join("timeline.json"),
+            format!(
+                r#"{{"script_sha256":"{}","duration_ms":0,"sample_rate":48000,"lines":[]}}"#,
+                crate::timeline::sha256_hex(script.as_bytes())
+            ),
+        )
+        .expect("write timeline");
+        let error = match load_project(&script_path) {
+            Err(error) => error,
+            Ok(_) => panic!("missing audio must fail"),
+        };
+        assert!(error.contains(&project_dir.join("full_dialogue.wav").display().to_string()));
+        std::fs::remove_dir_all(project_dir).expect("remove project directory");
+    }
+
+    #[test]
+    fn keeps_project_visible_when_output_start_fails() {
+        let state = project_view_state(Some("48000Hz 非対応"));
+        assert!(state.show_project);
+        assert!(!state.playback_enabled);
+        assert_eq!(state.output_error.as_deref(), Some("48000Hz 非対応"));
     }
 
     #[test]
@@ -281,7 +375,8 @@ mod tests {
             bits_per_sample: 16,
             sample_format: SampleFormat::Int,
         };
-        let mut writer = WavWriter::create(project_dir.join("full_dialogue.wav"), spec).expect("create wav");
+        let mut writer =
+            WavWriter::create(project_dir.join("full_dialogue.wav"), spec).expect("create wav");
         writer.write_sample(0_i16).expect("write wav");
         writer.finalize().expect("finalize wav");
 
@@ -294,9 +389,10 @@ mod tests {
 
     #[test]
     fn warns_only_when_audio_duration_differs_by_more_than_one_second() {
-        for (name, timeline_duration, expects_warning) in
-            [("duration-warning", 0_u64, true), ("duration-match", 2_000_u64, false)]
-        {
+        for (name, timeline_duration, expects_warning) in [
+            ("duration-warning", 0_u64, true),
+            ("duration-match", 2_000_u64, false),
+        ] {
             let project_dir = temp_project(name);
             let script_path = project_dir.join("第1回.txt");
             let script = "[S01-L001] 蒼真:こんにちは\n";
@@ -315,7 +411,8 @@ mod tests {
                 bits_per_sample: 16,
                 sample_format: SampleFormat::Int,
             };
-            let mut writer = WavWriter::create(project_dir.join("full_dialogue.wav"), spec).expect("create wav");
+            let mut writer =
+                WavWriter::create(project_dir.join("full_dialogue.wav"), spec).expect("create wav");
             for _ in 0..96_000 {
                 writer.write_sample(0_i16).expect("write wav");
             }
@@ -323,7 +420,11 @@ mod tests {
 
             let project = load_project(&script_path).expect("load project");
             assert_eq!(
-                project.warnings.0.iter().any(|warning| warning.contains("音声長")),
+                project
+                    .warnings
+                    .0
+                    .iter()
+                    .any(|warning| warning.contains("音声長")),
                 expects_warning
             );
             std::fs::remove_dir_all(project_dir).expect("remove project directory");

@@ -89,8 +89,21 @@ fn character_weight(character: char) -> f32 {
 fn is_small_kana(character: char) -> bool {
     matches!(
         character,
-        'ゃ' | 'ゅ' | 'ょ' | 'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ'
-            | 'ャ' | 'ュ' | 'ョ' | 'ァ' | 'ィ' | 'ゥ' | 'ェ' | 'ォ'
+        'ゃ' | 'ゅ'
+            | 'ょ'
+            | 'ぁ'
+            | 'ぃ'
+            | 'ぅ'
+            | 'ぇ'
+            | 'ぉ'
+            | 'ャ'
+            | 'ュ'
+            | 'ョ'
+            | 'ァ'
+            | 'ィ'
+            | 'ゥ'
+            | 'ェ'
+            | 'ォ'
     )
 }
 
@@ -105,7 +118,7 @@ fn is_cjk(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::{display_text, Seg};
+    use crate::script::{Seg, display_text};
 
     #[test]
     fn counts_kana_mora_with_small_kana_and_sokuon() {
@@ -127,8 +140,59 @@ mod tests {
         assert_eq!(spans.len(), display_text(&segs).chars().count());
         assert_eq!(spans.first().map(|span| span.start_ms), Some(100));
         assert_eq!(spans.last().map(|span| span.end_ms), Some(900));
-        assert!(spans.windows(2).all(|pair| pair[0].end_ms == pair[1].start_ms));
-        assert_eq!(spans[1].end_ms - spans[1].start_ms, spans[2].end_ms - spans[2].start_ms);
+        assert!(
+            spans
+                .windows(2)
+                .all(|pair| pair[0].end_ms == pair[1].start_ms)
+        );
+        assert_eq!(
+            spans[1].end_ms - spans[1].start_ms,
+            spans[2].end_ms - spans[2].start_ms
+        );
+    }
+
+    #[test]
+    fn distributes_ruby_time_in_whole_milliseconds_from_left_to_right() {
+        let spans = char_spans(
+            &[Seg::Ruby {
+                base: "東京".to_owned(),
+                reading: "とうきょう".to_owned(),
+            }],
+            0,
+            4_000,
+        );
+        assert_eq!(
+            spans,
+            vec![
+                CharSpan {
+                    start_ms: 0,
+                    end_ms: 2_000
+                },
+                CharSpan {
+                    start_ms: 2_000,
+                    end_ms: 4_000
+                },
+            ]
+        );
+
+        let spans = char_spans(&[Seg::Plain("abc".to_owned())], 0, 10);
+        assert_eq!(
+            spans,
+            vec![
+                CharSpan {
+                    start_ms: 0,
+                    end_ms: 4
+                },
+                CharSpan {
+                    start_ms: 4,
+                    end_ms: 7
+                },
+                CharSpan {
+                    start_ms: 7,
+                    end_ms: 10
+                },
+            ]
+        );
     }
 
     #[test]
