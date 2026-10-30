@@ -956,6 +956,45 @@ mod tests {
     }
 
     #[test]
+    fn headless_width_changes_keep_layout_cache_bounded() {
+        let ctx = egui::Context::default();
+        let items = visual_items(3);
+        let timeline = visual_timeline(&items);
+        let mut state = ScriptViewState::default();
+        for width in 200..800 {
+            let mut cache_entries = usize::MAX;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(width as f32, 120.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                        let cache_id = ui.id().with("script-layout-cache");
+                        cache_entries = ctx.data(|data| {
+                            data.get_temp::<Arc<Mutex<LayoutCache>>>(cache_id)
+                                .expect("draw must initialize the layout cache")
+                                .lock()
+                                .expect("script layout cache poisoned")
+                                .entries
+                                .len()
+                        });
+                    });
+                },
+            );
+            assert!(text_shape_count(&output.shapes) > 0);
+            assert!(
+                cache_entries <= 3,
+                "width={width}: cache entries={cache_entries}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore]
     fn episode_60_script_draws_text_at_all_scroll_positions_and_follow() {
         let root = std::path::Path::new(r"D:\UDS\YouTube\AI道具箱\第60回");
@@ -1015,6 +1054,52 @@ mod tests {
         ] {
             assert!(text_shape_count(&output.shapes) > 0);
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn episode_60_resize_frame_times_do_not_grow_with_cache_entries() {
+        use std::time::Instant;
+
+        let root = std::path::Path::new(r"D:\UDS\YouTube\AI道具箱\第60回");
+        let items = crate::script::parse_script(
+            &std::fs::read_to_string(root.join("第60回.txt")).expect("episode 60 script exists"),
+        );
+        let timeline = crate::timeline::parse_timeline(
+            &std::fs::read_to_string(root.join("timeline").join("timeline.json"))
+                .expect("episode 60 timeline exists"),
+        )
+        .expect("episode 60 timeline parses");
+        let ctx = egui::Context::default();
+        let mut state = ScriptViewState::default();
+        let mut block_ms = Vec::new();
+        for block in 0..6 {
+            let started = Instant::now();
+            for step in 0..100 {
+                let width = 300.0 + (block * 100 + step) as f32;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            egui::vec2(width, 240.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let _ = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                        });
+                    },
+                );
+                assert!(text_shape_count(&output.shapes) > 0);
+            }
+            block_ms.push(started.elapsed().as_secs_f64() * 10.0);
+        }
+        println!("episode 60 resize frame ms per 100-frame block: {block_ms:?}");
+        assert!(
+            block_ms[5] <= block_ms[0] * 3.0 + 1.0,
+            "frame time grew continuously: {block_ms:?}"
+        );
     }
 
     #[test]
