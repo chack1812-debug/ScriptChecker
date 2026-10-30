@@ -1,7 +1,7 @@
 //! ScriptChecker のライブラリ層。
 
-pub mod audio;
 pub mod app;
+pub mod audio;
 pub mod charmap;
 pub mod fonts;
 pub mod meter;

@@ -25,9 +25,7 @@ pub fn load_wav(path: &Path) -> Result<AudioData, String> {
         .map_err(|error| format!("WAV を開けません {}: {error}", path.display()))?;
     let spec = reader.spec();
     let samples = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<Result<Vec<_>, _>>(),
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<Vec<_>, _>>(),
         hound::SampleFormat::Int => {
             let scale = (1_i64 << (spec.bits_per_sample - 1)) as f32;
             reader
@@ -82,9 +80,14 @@ mod tests {
             sample_format: SampleFormat::Int,
             ..spec
         };
-        let mut writer = WavWriter::create(&integer_path, integer_spec).expect("create integer wav");
-        writer.write_sample(16_384_i16).expect("write integer sample");
-        writer.write_sample(-16_384_i16).expect("write integer sample");
+        let mut writer =
+            WavWriter::create(&integer_path, integer_spec).expect("create integer wav");
+        writer
+            .write_sample(16_384_i16)
+            .expect("write integer sample");
+        writer
+            .write_sample(-16_384_i16)
+            .expect("write integer sample");
         writer.finalize().expect("finalize integer wav");
         let integer_audio = load_wav(&integer_path).expect("load integer wav");
         assert!((integer_audio.samples[0] - 0.5).abs() < 0.001);

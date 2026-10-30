@@ -125,9 +125,7 @@ fn parse_line(line: &str) -> Option<ScriptItem> {
 }
 
 fn is_scene_id(scene: &str) -> bool {
-    scene.starts_with('S')
-        && scene.len() > 1
-        && scene[1..].bytes().all(|b| b.is_ascii_digit())
+    scene.starts_with('S') && scene.len() > 1 && scene[1..].bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -151,9 +149,11 @@ mod tests {
             parse_segs("ab'cd").as_slice(),
             [Seg::Plain(text)] if text == "ab'cd"
         ));
-        assert!(parse_segs("全角｜は区切りでない'a｜b'")
-            .iter()
-            .all(|seg| matches!(seg, Seg::Plain(_))));
+        assert!(
+            parse_segs("全角｜は区切りでない'a｜b'")
+                .iter()
+                .all(|seg| matches!(seg, Seg::Plain(_)))
+        );
     }
 
     #[test]

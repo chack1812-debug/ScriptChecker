@@ -13,10 +13,9 @@ pub fn install_japanese_font(ctx: &egui::Context) -> Result<(), String> {
         })
         .ok_or_else(|| format!("日本語フォントが見つかりません: {}", candidates.join(", ")))?;
     let mut definitions = egui::FontDefinitions::default();
-    definitions.font_data.insert(
-        name.to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
-    );
+    definitions
+        .font_data
+        .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         definitions
             .families

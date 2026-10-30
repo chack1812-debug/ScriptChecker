@@ -5,7 +5,9 @@ fn main() {
         "ScriptChecker",
         options,
         Box::new(move |creation_context| {
-            if let Err(error) = scriptchecker::fonts::install_japanese_font(&creation_context.egui_ctx) {
+            if let Err(error) =
+                scriptchecker::fonts::install_japanese_font(&creation_context.egui_ctx)
+            {
                 eprintln!("{error}");
             }
             Ok(Box::new(scriptchecker::app::App::new(script_path)))
