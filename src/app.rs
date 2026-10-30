@@ -11,7 +11,7 @@ use crate::{
     script::{parse_script, ScriptItem},
     timeline::{check_consistency, parse_timeline, Timeline, Warnings},
     transport::{Mode, Transport},
-    ui::controls::draw_controls,
+    ui::{controls::draw_controls, script_view::draw_script},
 };
 
 pub struct Project {
@@ -148,7 +148,22 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(project) = &self.project {
                 ui.heading(project.script_path.display().to_string());
-                ui.label("台本表示は Task 7 で追加します。");
+                let position = self
+                    .transport
+                    .lock()
+                    .map(|transport| transport.position_ms())
+                    .unwrap_or(0);
+                if let Some(seek_to) = draw_script(
+                    ui,
+                    &project.items,
+                    &project.timeline,
+                    position,
+                    self.follow,
+                    self.show_ruby,
+                ) && let Ok(mut transport) = self.transport.lock()
+                {
+                    transport.seek_ms(seek_to as i64);
+                }
             } else {
                 ui.label("台本を開くか、起動引数に第N回.txtを指定してください。");
             }
