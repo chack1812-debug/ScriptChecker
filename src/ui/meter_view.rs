@@ -4,10 +4,14 @@ use crate::meter::MeterFrame;
 
 pub const METER_WINDOW_S: f32 = 0.05;
 pub const METER_PANEL_WIDTH: f32 = 136.0;
+pub const NUMERIC_DISPLAY_INTERVAL_S: f64 = 0.05;
 
 #[derive(Default)]
 pub struct MeterViewState {
     peak_hold_dbfs: Vec<f32>,
+    displayed_levels: Vec<crate::meter::ChannelMeter>,
+    displayed_hold_dbfs: Vec<f32>,
+    last_numeric_update_s: Option<f64>,
 }
 
 impl MeterViewState {
@@ -23,11 +27,39 @@ impl MeterViewState {
 
     pub fn reset(&mut self) {
         self.peak_hold_dbfs.clear();
+        self.displayed_levels.clear();
+        self.displayed_hold_dbfs.clear();
+        self.last_numeric_update_s = None;
     }
 
     pub fn hold(&self) -> &[f32] {
         &self.peak_hold_dbfs
     }
+
+    pub fn update_numeric_display(&mut self, meter: &MeterFrame, now_s: f64) -> bool {
+        self.update(meter);
+        if !should_update_numeric_display(self.last_numeric_update_s, now_s) {
+            return false;
+        }
+        self.displayed_levels.clone_from(&meter.channels);
+        self.displayed_hold_dbfs.clone_from(&self.peak_hold_dbfs);
+        self.last_numeric_update_s = Some(now_s);
+        true
+    }
+
+    pub fn displayed_levels(&self) -> &[crate::meter::ChannelMeter] {
+        &self.displayed_levels
+    }
+
+    fn displayed_hold(&self) -> &[f32] {
+        &self.displayed_hold_dbfs
+    }
+}
+
+pub fn should_update_numeric_display(last_update_s: Option<f64>, now_s: f64) -> bool {
+    now_s.is_finite()
+        && last_update_s
+            .is_none_or(|last_update_s| now_s - last_update_s >= NUMERIC_DISPLAY_INTERVAL_S)
 }
 
 pub fn meter_y_fraction(dbfs: f32) -> f32 {
@@ -77,16 +109,17 @@ fn number_cell_rect(number_rect: Rect, row: usize, column: usize) -> Rect {
     )
 }
 
-pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFrame) {
-    let _ = draw_meter_with_report(ui, state, meter);
+pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFrame, now_s: f64) {
+    let _ = draw_meter_with_report(ui, state, meter, now_s);
 }
 
 fn draw_meter_with_report(
     ui: &mut egui::Ui,
     state: &mut MeterViewState,
     meter: &MeterFrame,
+    now_s: f64,
 ) -> (Vec<Rect>, Rect) {
-    state.update(meter);
+    state.update_numeric_display(meter, now_s);
     let height = ui.available_height().max(120.0);
     let available = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), height));
     let layout = meter_layout(available);
@@ -152,12 +185,12 @@ fn draw_meter_with_report(
             ui.visuals().weak_text_color(),
         ));
         for channel in 0..2 {
-            let value = meter.channels.get(channel);
+            let value = state.displayed_levels().get(channel);
             let dbfs = match row {
                 0 => value.map_or(f32::NEG_INFINITY, |level| level.rms_dbfs),
                 1 => value.map_or(f32::NEG_INFINITY, |level| level.peak_dbfs),
                 _ => state
-                    .hold()
+                    .displayed_hold()
                     .get(channel)
                     .copied()
                     .unwrap_or(f32::NEG_INFINITY),
@@ -188,6 +221,32 @@ fn draw_line(painter: &egui::Painter, bar: Rect, dbfs: f32, color: Color32) {
 mod tests {
     use super::*;
     use crate::meter::{ChannelMeter, MeterFrame};
+
+    #[test]
+    fn numeric_display_updates_only_after_fifty_milliseconds() {
+        assert!(should_update_numeric_display(None, 0.0));
+        assert!(!should_update_numeric_display(Some(1.0), 1.049));
+        assert!(should_update_numeric_display(Some(1.0), 1.05));
+
+        let first = MeterFrame {
+            channels: vec![ChannelMeter {
+                rms_dbfs: -20.0,
+                peak_dbfs: -10.0,
+            }],
+        };
+        let second = MeterFrame {
+            channels: vec![ChannelMeter {
+                rms_dbfs: -40.0,
+                peak_dbfs: -30.0,
+            }],
+        };
+        let mut state = MeterViewState::default();
+        assert!(state.update_numeric_display(&first, 0.0));
+        assert!(!state.update_numeric_display(&second, 0.049));
+        assert_eq!(state.displayed_levels()[0].rms_dbfs, -20.0);
+        assert!(state.update_numeric_display(&second, 0.05));
+        assert_eq!(state.displayed_levels()[0].rms_dbfs, -40.0);
+    }
 
     #[test]
     fn maps_dbfs_and_holds_channel_peaks() {
@@ -263,7 +322,8 @@ mod tests {
                             },
                         ],
                     };
-                    let (text_rects, number_rect) = draw_meter_with_report(ui, &mut state, &meter);
+                    let (text_rects, number_rect) =
+                        draw_meter_with_report(ui, &mut state, &meter, 0.0);
                     assert_eq!(text_rects.len(), 9);
                     assert!(
                         text_rects

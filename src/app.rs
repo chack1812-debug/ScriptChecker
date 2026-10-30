@@ -233,7 +233,12 @@ impl eframe::App for App {
                         position_ms as f32 / 1_000.0,
                         METER_WINDOW_S,
                     );
-                    draw_meter(ui, &mut self.meter_state, &meter);
+                    draw_meter(
+                        ui,
+                        &mut self.meter_state,
+                        &meter,
+                        ctx.input(|input| input.time),
+                    );
                 }
             });
         egui::CentralPanel::default().show(ctx, |ui| {
