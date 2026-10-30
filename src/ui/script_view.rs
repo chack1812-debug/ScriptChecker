@@ -1090,7 +1090,7 @@ mod tests {
         .expect("episode 60 timeline parses");
         let ctx = egui::Context::default();
         let mut state = ScriptViewState::default();
-        let mut block_ms = Vec::new();
+        let mut frame_ms = Vec::new();
         for block in 0..6 {
             let started = Instant::now();
             for step in 0..100 {
@@ -1111,12 +1111,12 @@ mod tests {
                 );
                 assert!(text_shape_count(&output.shapes) > 0);
             }
-            block_ms.push(started.elapsed().as_secs_f64() * 10.0);
+            frame_ms.push(started.elapsed().as_secs_f64() * 10.0);
         }
-        println!("episode 60 resize frame ms per 100-frame block: {block_ms:?}");
+        println!("episode 60 resize average ms per frame: {frame_ms:?}");
         assert!(
-            block_ms[5] <= block_ms[0] * 3.0 + 1.0,
-            "frame time grew continuously: {block_ms:?}"
+            frame_ms[5] <= frame_ms[0] * 3.0 + 1.0,
+            "frame time grew continuously: {frame_ms:?}"
         );
     }
 
