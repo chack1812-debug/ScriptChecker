@@ -453,8 +453,10 @@ mod tests {
 
     #[test]
     fn cache_generation_discards_entries_when_width_changes() {
-        let mut cache = LayoutCache::default();
-        cache.width_bits = 600.0_f32.to_bits();
+        let mut cache = LayoutCache {
+            width_bits: 600.0_f32.to_bits(),
+            ..Default::default()
+        };
         cache.entries.insert(
             ("S01-L001:old".to_owned(), true),
             Arc::new(LineLayout {
