@@ -3,6 +3,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke};
 use crate::meter::MeterFrame;
 
 pub const METER_WINDOW_S: f32 = 0.05;
+pub const METER_PANEL_WIDTH: f32 = 136.0;
 
 #[derive(Default)]
 pub struct MeterViewState {
@@ -39,16 +40,15 @@ struct MeterLayout {
     number_rect: Rect,
 }
 
-fn meter_layout(available: Rect, channel_count: usize) -> MeterLayout {
-    let width = available.width().min(90.0);
+fn meter_layout(available: Rect) -> MeterLayout {
+    let width = available.width().min(METER_PANEL_WIDTH);
     let rect = Rect::from_min_size(available.min, egui::vec2(width, available.height()));
-    let number_height = 16.0_f32.min(rect.height());
+    let number_height = 58.0_f32.min(rect.height());
     let number_rect = Rect::from_min_max(
         Pos2::new(rect.left(), rect.bottom() - number_height),
         rect.right_bottom(),
     );
     let bar_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right(), number_rect.top()));
-    let _ = channel_count;
     MeterLayout {
         rect,
         bar_rect,
@@ -56,11 +56,40 @@ fn meter_layout(available: Rect, channel_count: usize) -> MeterLayout {
     }
 }
 
+fn level_text(dbfs: f32) -> String {
+    if dbfs <= -100.0 {
+        "-∞".to_owned()
+    } else {
+        format!("{dbfs:+.1}")
+    }
+}
+
+fn number_cell_rect(number_rect: Rect, row: usize, column: usize) -> Rect {
+    let label_width = 31.0;
+    let row_height = number_rect.height() / 3.0;
+    let value_width = (number_rect.width() - label_width).max(0.0) / 2.0;
+    Rect::from_min_size(
+        Pos2::new(
+            label_width + number_rect.left() + value_width * column as f32,
+            number_rect.top() + row_height * row as f32,
+        ),
+        egui::vec2(value_width, row_height),
+    )
+}
+
 pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFrame) {
+    let _ = draw_meter_with_report(ui, state, meter);
+}
+
+fn draw_meter_with_report(
+    ui: &mut egui::Ui,
+    state: &mut MeterViewState,
+    meter: &MeterFrame,
+) -> (Vec<Rect>, Rect) {
     state.update(meter);
     let height = ui.available_height().max(120.0);
     let available = Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), height));
-    let layout = meter_layout(available, 2);
+    let layout = meter_layout(available);
     let (rect, _) = ui.allocate_exact_size(layout.rect.size(), egui::Sense::hover());
     let bar_rect = Rect::from_min_size(rect.min, layout.bar_rect.size());
     let number_rect = Rect::from_min_size(
@@ -77,7 +106,7 @@ pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFr
             Align2::LEFT_CENTER,
             format!("{dbfs:.0}"),
             FontId::proportional(9.0),
-            Color32::LIGHT_GRAY,
+            ui.visuals().weak_text_color(),
         );
         painter.line_segment(
             [
@@ -95,7 +124,7 @@ pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFr
         );
         painter.rect_filled(bar, 0.0, Color32::from_gray(30));
         if let Some(level) = meter.channels.get(channel) {
-            let rms_y = rect.bottom() - meter_y_fraction(level.rms_dbfs) * rect.height();
+            let rms_y = bar.bottom() - meter_y_fraction(level.rms_dbfs) * bar.height();
             painter.rect_filled(
                 Rect::from_min_max(Pos2::new(bar.left(), rms_y), bar.right_bottom()),
                 0.0,
@@ -110,15 +139,41 @@ pub fn draw_meter(ui: &mut egui::Ui, state: &mut MeterViewState, meter: &MeterFr
             if let Some(hold) = state.hold().get(channel) {
                 draw_line(&painter, bar, *hold, Color32::RED);
             }
-            painter.text(
-                Pos2::new(bar.center().x, number_rect.top() + 1.0),
-                Align2::CENTER_TOP,
-                format!("{:.1}", level.peak_dbfs),
-                FontId::proportional(8.0),
-                Color32::WHITE,
-            );
         }
     }
+    let mut text_rects = Vec::new();
+    for (row, label) in ["RMS", "Peak", "Hold"].into_iter().enumerate() {
+        let y = number_rect.top() + number_rect.height() * (row as f32 + 0.5) / 3.0;
+        text_rects.push(painter.text(
+            Pos2::new(number_rect.left(), y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(9.0),
+            ui.visuals().weak_text_color(),
+        ));
+        for channel in 0..2 {
+            let value = meter.channels.get(channel);
+            let dbfs = match row {
+                0 => value.map_or(f32::NEG_INFINITY, |level| level.rms_dbfs),
+                1 => value.map_or(f32::NEG_INFINITY, |level| level.peak_dbfs),
+                _ => state
+                    .hold()
+                    .get(channel)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY),
+            };
+            let cell = number_cell_rect(number_rect, row, channel);
+            let text_rect = painter.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                level_text(dbfs),
+                FontId::proportional(9.0),
+                ui.visuals().text_color(),
+            );
+            text_rects.push(text_rect);
+        }
+    }
+    (text_rects, number_rect)
 }
 
 fn draw_line(painter: &egui::Painter, bar: Rect, dbfs: f32, color: Color32) {
@@ -163,10 +218,65 @@ mod tests {
     #[test]
     fn meter_layout_keeps_bars_and_peak_numbers_inside_available_rect() {
         let outer = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(74.0, 200.0));
-        let layout = meter_layout(outer, 2);
+        let layout = meter_layout(outer);
         assert!(layout.rect.width() <= outer.width());
         assert!(outer.contains_rect(layout.bar_rect));
         assert!(outer.contains_rect(layout.number_rect));
         assert_eq!(layout.bar_rect.bottom(), layout.number_rect.top());
+    }
+
+    #[test]
+    fn formats_floor_and_lays_out_all_numeric_cells_inside_panel() {
+        assert_eq!(level_text(-120.0), "-∞");
+        assert_eq!(level_text(-9.94), "-9.9");
+        let number = Rect::from_min_size(Pos2::ZERO, egui::vec2(136.0, 58.0));
+        for row in 0..3 {
+            for column in 0..2 {
+                assert!(number.contains_rect(number_cell_rect(number, row, column)));
+            }
+        }
+    }
+
+    #[test]
+    fn headless_meter_draws_nine_numeric_texts_inside_its_number_rect() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(METER_PANEL_WIDTH, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut state = MeterViewState::default();
+                    let meter = MeterFrame {
+                        channels: vec![
+                            ChannelMeter {
+                                rms_dbfs: 0.0,
+                                peak_dbfs: -120.0,
+                            },
+                            ChannelMeter {
+                                rms_dbfs: -12.0,
+                                peak_dbfs: -3.0,
+                            },
+                        ],
+                    };
+                    let (text_rects, number_rect) = draw_meter_with_report(ui, &mut state, &meter);
+                    assert_eq!(text_rects.len(), 9);
+                    assert!(
+                        text_rects
+                            .iter()
+                            .all(|rect| number_rect.contains_rect(*rect))
+                    );
+                    let bar = Rect::from_min_max(Pos2::new(32.0, 0.0), Pos2::new(84.0, 100.0));
+                    assert_eq!(
+                        bar.top(),
+                        bar.bottom() - meter_y_fraction(0.0) * bar.height()
+                    );
+                });
+            },
+        );
     }
 }

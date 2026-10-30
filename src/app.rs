@@ -14,7 +14,7 @@ use crate::{
     transport::{Mode, Transport},
     ui::{
         controls::{ControlState, apply_command, draw_controls},
-        meter_view::{METER_WINDOW_S, MeterViewState, draw_meter},
+        meter_view::{METER_PANEL_WIDTH, METER_WINDOW_S, MeterViewState, draw_meter},
         script_view::draw_script,
     },
 };
@@ -205,7 +205,7 @@ impl eframe::App for App {
             }
         });
         egui::SidePanel::right("meter")
-            .exact_width(90.0)
+            .exact_width(METER_PANEL_WIDTH)
             .show(ctx, |ui| {
                 if let Some(project) = &self.project {
                     let (position_ms, stopped, seek_epoch) = self

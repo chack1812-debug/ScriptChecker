@@ -51,47 +51,59 @@ pub fn draw_controls(
             }
         });
 
-        let mut position = state.position_ms;
-        let left = format_time(position);
-        let right = format_time(total_ms);
-        ui.horizontal(|ui| {
-            let available = ui.available_width();
-            let (left_width, right_width) = ui.fonts(|fonts| {
-                let font =
-                    egui::FontId::proportional(egui::TextStyle::Body.resolve(ui.style()).size);
-                (
-                    fonts
-                        .layout_no_wrap(left.clone(), font.clone(), egui::Color32::WHITE)
-                        .rect
-                        .width(),
-                    fonts
-                        .layout_no_wrap(right.clone(), font, egui::Color32::WHITE)
-                        .rect
-                        .width(),
-                )
-            });
-            ui.label(left);
-            let response = ui.add_sized(
-                egui::vec2(
-                    slider_width(
-                        available,
-                        left_width,
-                        right_width,
-                        ui.spacing().item_spacing.x,
-                    ),
-                    0.0,
-                ),
+        let (seek_command, _) = draw_seek_row(ui, state.position_ms, total_ms);
+        command = command.or(seek_command);
+    });
+    command
+}
+
+fn draw_seek_row(
+    ui: &mut egui::Ui,
+    initial_position: u64,
+    total_ms: u64,
+) -> (Option<ControlCommand>, f32) {
+    let mut position = initial_position;
+    let left = format_time(position);
+    let right = format_time(total_ms);
+    let mut command = None;
+    let mut drawn_width = 0.0;
+    ui.horizontal(|ui| {
+        let available = ui.available_width();
+        let (left_width, right_width) = ui.fonts(|fonts| {
+            let font = egui::FontId::proportional(egui::TextStyle::Body.resolve(ui.style()).size);
+            (
+                fonts
+                    .layout_no_wrap(left.clone(), font.clone(), ui.visuals().text_color())
+                    .rect
+                    .width(),
+                fonts
+                    .layout_no_wrap(right.clone(), font, ui.visuals().text_color())
+                    .rect
+                    .width(),
+            )
+        });
+        let width = slider_width(
+            available,
+            left_width,
+            right_width,
+            ui.spacing().item_spacing.x,
+        );
+        ui.label(left);
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = width;
+            let response = ui.add(
                 egui::Slider::new(&mut position, 0..=total_ms)
                     .show_value(false)
                     .clamping(egui::SliderClamping::Always),
             );
+            drawn_width = response.rect.width();
             if response.dragged() || response.changed() {
                 command = Some(ControlCommand::Seek(position));
             }
-            ui.label(right);
         });
+        ui.label(right);
     });
-    command
+    (command, drawn_width)
 }
 
 pub fn slider_width(
@@ -145,5 +157,55 @@ mod tests {
         assert_eq!(transport.position_ms(), 12_345);
         apply_command(&mut transport, ControlCommand::Skip(-(SKIP_MS as i64)));
         assert_eq!(transport.position_ms(), 2_345);
+    }
+
+    #[test]
+    fn headless_slider_uses_configured_width_at_each_window_size() {
+        for width in [1000.0, 600.0, 300.0, 200.0, 140.0] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 120.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let available = ui.available_width();
+                        let left = format_time(0);
+                        let right = format_time(60_000);
+                        let (left_width, right_width) = ui.fonts(|fonts| {
+                            let font = egui::FontId::proportional(
+                                egui::TextStyle::Body.resolve(ui.style()).size,
+                            );
+                            (
+                                fonts
+                                    .layout_no_wrap(left, font.clone(), ui.visuals().text_color())
+                                    .rect
+                                    .width(),
+                                fonts
+                                    .layout_no_wrap(right, font, ui.visuals().text_color())
+                                    .rect
+                                    .width(),
+                            )
+                        });
+                        let expected = slider_width(
+                            available,
+                            left_width,
+                            right_width,
+                            ui.spacing().item_spacing.x,
+                        );
+                        let (_, actual) = draw_seek_row(ui, 0, 60_000);
+                        assert!(
+                            (actual - expected).abs() < 0.01,
+                            "width={width}: {actual} != {expected}"
+                        );
+                    });
+                },
+            );
+            assert!(!output.shapes.is_empty());
+        }
     }
 }
