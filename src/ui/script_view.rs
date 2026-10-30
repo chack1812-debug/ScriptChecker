@@ -379,10 +379,15 @@ pub fn draw_script(
                         }
                     });
                     if follow
+                        && view_state.drag_start.is_none()
                         && (changed || follow_started)
                         && matches!(state, LineState::Current { .. })
                     {
-                        ui.scroll_to_rect(response.rect, None);
+                        ui.scroll_to_rect_animation(
+                            response.rect,
+                            None,
+                            egui::style::ScrollAnimation::none(),
+                        );
                     }
                 }
             }
@@ -675,6 +680,7 @@ fn paint_line(
         for token in &layout.tokens[range.clone()] {
             let selected = token_is_selected(selection, line_index, token);
             let color = token_color(ui.visuals(), state, token, selected);
+            let ruby_color = ruby_text_color(ui.visuals(), state);
             let base_rect = Rect::from_min_size(
                 Pos2::new(x, base_y),
                 egui::vec2(token.width, layout.base_size * 1.35),
@@ -701,7 +707,7 @@ fn paint_line(
                     Align2::LEFT_TOP,
                     ruby,
                     FontId::proportional(layout.ruby_size),
-                    color,
+                    ruby_color,
                 );
             }
             painter.text(
@@ -760,6 +766,19 @@ fn token_color(
     match state {
         LineState::Past => past_text_color(visuals, background),
         _ => readable_text_color(background),
+    }
+}
+
+fn ruby_text_color(visuals: &egui::Visuals, state: LineState) -> Color32 {
+    let background = if matches!(state, LineState::Current { .. }) {
+        current_background(visuals)
+    } else {
+        visuals.panel_fill
+    };
+    if matches!(state, LineState::Past) {
+        past_text_color(visuals, background)
+    } else {
+        readable_text_color(background)
     }
 }
 
@@ -982,6 +1001,44 @@ mod tests {
             .collect()
     }
 
+    fn ruby_contrast_items() -> Vec<ScriptItem> {
+        [
+            ("S01-L001", "過去", "かこ"),
+            ("S01-L002", "済今後", "ずみいまあと"),
+            ("S01-L003", "未来", "みらい"),
+        ]
+        .into_iter()
+        .map(|(id, base, reading)| {
+            ScriptItem::Line(ScriptLine {
+                id: id.to_owned(),
+                scene: "S01".to_owned(),
+                cast: "蒼真".to_owned(),
+                segs: if id == "S01-L002" {
+                    vec![
+                        Seg::Ruby {
+                            base: "済".to_owned(),
+                            reading: "ずみ".to_owned(),
+                        },
+                        Seg::Ruby {
+                            base: "今".to_owned(),
+                            reading: "いま".to_owned(),
+                        },
+                        Seg::Ruby {
+                            base: "後".to_owned(),
+                            reading: "あと".to_owned(),
+                        },
+                    ]
+                } else {
+                    vec![Seg::Ruby {
+                        base: base.to_owned(),
+                        reading: reading.to_owned(),
+                    }]
+                },
+            })
+        })
+        .collect()
+    }
+
     fn visual_timeline(items: &[ScriptItem]) -> Timeline {
         Timeline {
             script_sha256: String::new(),
@@ -1051,43 +1108,62 @@ mod tests {
             .find_map(|clipped| find(&clipped.shape, wanted))
     }
 
-    fn text_shape_and_smallest_background(
+    fn test_luminance(color: Color32) -> f32 {
+        let linear = |component: u8| {
+            let component = component as f32 / 255.0;
+            if component <= 0.04045 {
+                component / 12.92
+            } else {
+                ((component + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    fn test_contrast_ratio(left: Color32, right: Color32) -> f32 {
+        let (left, right) = (test_luminance(left), test_luminance(right));
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
+    fn drawn_text_colours_over_topmost_fill(
         shapes: &[egui::epaint::ClippedShape],
-        wanted: &str,
-    ) -> Option<(Color32, Color32)> {
+    ) -> Vec<(String, Color32, Color32)> {
         fn collect(
             shape: &egui::epaint::Shape,
-            wanted: &str,
-            text: &mut Option<(Rect, Color32)>,
-            backgrounds: &mut Vec<(Rect, Color32)>,
+            fills: &mut Vec<(Rect, Color32)>,
+            texts: &mut Vec<(String, Color32, Color32)>,
         ) {
             match shape {
-                egui::epaint::Shape::Text(value) if value.galley.job.text == wanted => {
-                    *text = Some((
-                        value.galley.rect.translate(value.pos.to_vec2()),
-                        value.override_text_color.unwrap_or(value.fallback_color),
+                egui::epaint::Shape::Rect(rect) => fills.push((rect.rect, rect.fill)),
+                egui::epaint::Shape::Text(text) => {
+                    let text_rect = text.galley.rect.translate(text.pos.to_vec2());
+                    let background = fills
+                        .iter()
+                        .rev()
+                        .find(|(rect, _)| rect.contains(text_rect.center()))
+                        .expect("each drawn script text must have a preceding fill")
+                        .1;
+                    texts.push((
+                        text.galley.job.text.clone(),
+                        text.override_text_color.unwrap_or(text.fallback_color),
+                        background,
                     ));
                 }
-                egui::epaint::Shape::Rect(value) => backgrounds.push((value.rect, value.fill)),
                 egui::epaint::Shape::Vec(shapes) => {
                     for shape in shapes {
-                        collect(shape, wanted, text, backgrounds);
+                        collect(shape, fills, texts);
                     }
                 }
                 _ => {}
             }
         }
-        let mut text = None;
-        let mut backgrounds = Vec::new();
+
+        let mut fills = Vec::new();
+        let mut texts = Vec::new();
         for clipped in shapes {
-            collect(&clipped.shape, wanted, &mut text, &mut backgrounds);
+            collect(&clipped.shape, &mut fills, &mut texts);
         }
-        let (text_rect, text_color) = text?;
-        backgrounds
-            .into_iter()
-            .filter(|(rect, _)| rect.contains_rect(text_rect))
-            .min_by(|(left, _), (right, _)| left.area().total_cmp(&right.area()))
-            .map(|(_, background)| (text_color, background))
+        texts
     }
 
     fn draw_visual_frame(
@@ -1099,47 +1175,62 @@ mod tests {
         events: Vec<egui::Event>,
         state: &mut ScriptViewState,
     ) -> eframe::egui::FullOutput {
-        draw_visual_frame_with_ruby(ctx, items, timeline, pos_ms, follow, false, events, state)
+        draw_visual_frame_with_ruby(
+            ctx,
+            ScriptFrame::new(items, timeline, pos_ms, follow, false),
+            events,
+            state,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScriptFrame<'a> {
+        items: &'a [ScriptItem],
+        timeline: &'a Timeline,
+        pos_ms: u64,
+        follow: bool,
+        show_ruby: bool,
+    }
+
+    impl<'a> ScriptFrame<'a> {
+        fn new(
+            items: &'a [ScriptItem],
+            timeline: &'a Timeline,
+            pos_ms: u64,
+            follow: bool,
+            show_ruby: bool,
+        ) -> Self {
+            Self {
+                items,
+                timeline,
+                pos_ms,
+                follow,
+                show_ruby,
+            }
+        }
     }
 
     fn draw_visual_frame_with_ruby(
         ctx: &egui::Context,
-        items: &[ScriptItem],
-        timeline: &Timeline,
-        pos_ms: u64,
-        follow: bool,
-        show_ruby: bool,
+        frame: ScriptFrame<'_>,
         events: Vec<egui::Event>,
         state: &mut ScriptViewState,
     ) -> eframe::egui::FullOutput {
-        draw_script_frame(
-            ctx, items, timeline, pos_ms, follow, show_ruby, events, state,
-        )
-        .0
+        draw_script_frame(ctx, frame, events, state).0
     }
 
     fn draw_script_frame(
         ctx: &egui::Context,
-        items: &[ScriptItem],
-        timeline: &Timeline,
-        pos_ms: u64,
-        follow: bool,
-        show_ruby: bool,
+        frame: ScriptFrame<'_>,
         events: Vec<egui::Event>,
         state: &mut ScriptViewState,
     ) -> (eframe::egui::FullOutput, Option<u64>) {
-        draw_script_frame_at_time(
-            ctx, items, timeline, pos_ms, follow, show_ruby, events, None, state,
-        )
+        draw_script_frame_at_time(ctx, frame, events, None, state)
     }
 
     fn draw_script_frame_at_time(
         ctx: &egui::Context,
-        items: &[ScriptItem],
-        timeline: &Timeline,
-        pos_ms: u64,
-        follow: bool,
-        show_ruby: bool,
+        frame: ScriptFrame<'_>,
         events: Vec<egui::Event>,
         time: Option<f64>,
         state: &mut ScriptViewState,
@@ -1147,7 +1238,15 @@ mod tests {
         let mut seek_to = None;
         let output = ctx.run(selection_input_at_time(events, time), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                seek_to = draw_script(ui, items, timeline, pos_ms, follow, show_ruby, state);
+                seek_to = draw_script(
+                    ui,
+                    frame.items,
+                    frame.timeline,
+                    frame.pos_ms,
+                    frame.follow,
+                    frame.show_ruby,
+                    state,
+                );
             });
         });
         (output, seek_to)
@@ -1707,16 +1806,16 @@ mod tests {
         let items = visual_items(80);
         let timeline = visual_timeline(&items);
         let mut state = ScriptViewState::default();
-        let (_, seek_to) =
-            draw_script_frame(&ctx, &items, &timeline, 0, false, false, vec![], &mut state);
+        let (_, seek_to) = draw_script_frame(
+            &ctx,
+            ScriptFrame::new(&items, &timeline, 0, false, false),
+            vec![],
+            &mut state,
+        );
         assert_eq!(seek_to, None);
         let (_, seek_to) = draw_script_frame(
             &ctx,
-            &items,
-            &timeline,
-            0,
-            false,
-            false,
+            ScriptFrame::new(&items, &timeline, 0, false, false),
             vec![egui::Event::PointerButton {
                 pos: Pos2::new(105.0, 15.0),
                 button: egui::PointerButton::Primary,
@@ -1731,11 +1830,7 @@ mod tests {
         for _ in 0..30 {
             let (_, seek_to) = draw_script_frame(
                 &ctx,
-                &items,
-                &timeline,
-                0,
-                false,
-                false,
+                ScriptFrame::new(&items, &timeline, 0, false, false),
                 vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
                 &mut state,
             );
@@ -1771,11 +1866,7 @@ mod tests {
 
         let (_, seek_to) = draw_script_frame(
             &ctx,
-            &items,
-            &timeline,
-            0,
-            false,
-            false,
+            ScriptFrame::new(&items, &timeline, 0, false, false),
             vec![egui::Event::PointerButton {
                 pos: Pos2::new(124.0, 114.0),
                 button: egui::PointerButton::Primary,
@@ -1788,11 +1879,7 @@ mod tests {
         for _ in 0..4 {
             let (_, seek_to) = draw_script_frame(
                 &ctx,
-                &items,
-                &timeline,
-                0,
-                false,
-                false,
+                ScriptFrame::new(&items, &timeline, 0, false, false),
                 vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
                 &mut state,
             );
@@ -1802,11 +1889,7 @@ mod tests {
         for _ in 0..3 {
             let (_, seek_to) = draw_script_frame(
                 &ctx,
-                &items,
-                &timeline,
-                0,
-                false,
-                false,
+                ScriptFrame::new(&items, &timeline, 0, false, false),
                 vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
                 &mut state,
             );
@@ -1820,20 +1903,105 @@ mod tests {
     }
 
     #[test]
-    fn headless_current_token_uses_a_contrasting_text_shape_over_its_real_fill() {
+    fn headless_follow_does_not_override_lower_edge_drag_but_restarts_after_release() {
         let ctx = egui::Context::default();
-        let items = vec![ScriptItem::Line(ScriptLine {
-            id: "S01-L001".to_owned(),
-            scene: "S01".to_owned(),
-            cast: "蒼真".to_owned(),
-            segs: vec![Seg::Plain("abc".to_owned())],
-        })];
-        let timeline = selection_timeline();
+        let items = visual_items(80);
+        let timeline = visual_timeline(&items);
         let mut state = ScriptViewState::default();
-        let output = draw_visual_frame(&ctx, &items, &timeline, 100, false, vec![], &mut state);
-        let (text, background) = text_shape_and_smallest_background(&output.shapes, "a")
-            .expect("the current token and its fill must be drawn");
-        assert!(contrast_ratio(text, background) >= 4.5);
+        let _ = draw_script_frame(
+            &ctx,
+            ScriptFrame::new(&items, &timeline, 0, true, false),
+            vec![],
+            &mut state,
+        );
+        let _ = draw_script_frame(
+            &ctx,
+            ScriptFrame::new(&items, &timeline, 0, true, false),
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(105.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        let mut offsets = Vec::new();
+        let mut end_lines = Vec::new();
+        for frame in 0..30 {
+            let position_ms = if frame < 20 { 0 } else { 1_000 };
+            let (_, seek_to) = draw_script_frame(
+                &ctx,
+                ScriptFrame::new(&items, &timeline, position_ms, true, false),
+                vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
+                &mut state,
+            );
+            assert_eq!(seek_to, None);
+            offsets.push(state.scroll_offset_y());
+            end_lines.push(
+                state
+                    .selection()
+                    .expect("drag must extend the selection")
+                    .end
+                    .line,
+            );
+        }
+        assert!(offsets.windows(2).all(|window| window[1] >= window[0]));
+        assert!(end_lines.windows(2).all(|window| window[1] >= window[0]));
+        let held_offset = state.scroll_offset_y();
+        let (_, seek_to) = draw_script_frame(
+            &ctx,
+            ScriptFrame::new(&items, &timeline, 1_000, true, false),
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(124.0, 114.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        assert_eq!(seek_to, None);
+        let mut followed = None;
+        for frame in 0..30 {
+            let (output, seek_to) = draw_script_frame_at_time(
+                &ctx,
+                ScriptFrame::new(&items, &timeline, 2_000, true, false),
+                vec![],
+                Some(1.0 + f64::from(frame) / 60.0),
+                &mut state,
+            );
+            assert_eq!(seek_to, None);
+            followed = Some(output);
+        }
+        let _ = followed.expect("follow frames must run");
+        assert!(
+            state.scroll_offset_y() < held_offset,
+            "the next current-line change after release must resume follow"
+        );
+    }
+
+    #[test]
+    fn headless_current_token_uses_a_contrasting_text_shape_over_its_real_fill() {
+        let items = ruby_contrast_items();
+        let timeline = visual_timeline(&items);
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            let mut state = ScriptViewState::default();
+            let output = draw_visual_frame_with_ruby(
+                &ctx,
+                ScriptFrame::new(&items, &timeline, 1_500, false, true),
+                vec![],
+                &mut state,
+            );
+            let (_, text, background) = drawn_text_colours_over_topmost_fill(&output.shapes)
+                .into_iter()
+                .find(|(text, _, _)| text == "いま")
+                .expect("the current token ruby must be drawn");
+            assert!(
+                test_contrast_ratio(text, background) >= 4.5,
+                "current ruby must contrast with its actual fill"
+            );
+        }
     }
 
     #[test]
@@ -1959,34 +2127,45 @@ mod tests {
 
     #[test]
     fn every_drawn_script_text_colour_meets_wcag_contrast_in_both_themes() {
-        let token = ScriptToken {
-            base: "文".to_owned(),
-            ruby: None,
-            width: 10.0,
-            ruby_width: 0.0,
-            base_width: 10.0,
-            char_start: 0,
-            char_count: 1,
-            prohibit_line_start: false,
-        };
+        let items = ruby_contrast_items();
+        let timeline = visual_timeline(&items);
         for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
-            for state in [
-                LineState::Past,
-                LineState::Current { char: None },
-                LineState::Current { char: Some(0) },
-                LineState::Future,
-            ] {
-                for selected in [false, true] {
-                    let background = token_background(&visuals, state, &token, selected);
-                    assert!(
-                        contrast_ratio(token_color(&visuals, state, &token, selected), background)
-                            >= 4.5,
-                        "state={state:?}, selected={selected}"
-                    );
-                }
-            }
-            for background in [visuals.panel_fill, current_background(&visuals)] {
-                assert!(contrast_ratio(readable_text_color(background), background) >= 4.5);
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            let mut state = ScriptViewState::default();
+            let output = draw_visual_frame_with_ruby(
+                &ctx,
+                ScriptFrame::new(&items, &timeline, 1_500, false, true),
+                vec![],
+                &mut state,
+            );
+            let drawn = drawn_text_colours_over_topmost_fill(&output.shapes);
+            assert!(
+                drawn.iter().any(|(text, _, _)| text == "かこ"),
+                "Past line ruby must be drawn"
+            );
+            assert!(
+                drawn.iter().any(|(text, _, _)| text == "ずみ"),
+                "already-spoken current-line ruby must be drawn"
+            );
+            assert!(
+                drawn.iter().any(|(text, _, _)| text == "いま"),
+                "current-token ruby must be drawn"
+            );
+            assert!(
+                drawn.iter().any(|(text, _, _)| text == "あと"),
+                "not-yet-spoken current-line ruby must be drawn"
+            );
+            assert!(
+                drawn.iter().any(|(text, _, _)| text == "みらい"),
+                "Future line ruby must be drawn"
+            );
+            for (text, foreground, background) in drawn {
+                assert!(
+                    test_contrast_ratio(foreground, background) >= 4.5,
+                    "text={text:?} contrast={} foreground={foreground:?} background={background:?}",
+                    test_contrast_ratio(foreground, background)
+                );
             }
         }
     }
