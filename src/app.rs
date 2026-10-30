@@ -15,7 +15,7 @@ use crate::{
     ui::{
         controls::{ControlState, apply_command, draw_controls},
         meter_view::{METER_PANEL_WIDTH, METER_WINDOW_S, MeterViewState, draw_meter},
-        script_view::draw_script,
+        script_view::{ScriptViewState, draw_script},
     },
 };
 
@@ -76,6 +76,7 @@ pub struct App {
     error: Option<String>,
     output_error: Option<String>,
     meter_state: MeterViewState,
+    script_view_state: ScriptViewState,
     last_seek_epoch: u64,
 }
 
@@ -90,6 +91,7 @@ impl App {
             error: None,
             output_error: None,
             meter_state: MeterViewState::default(),
+            script_view_state: ScriptViewState::default(),
             last_seek_epoch: 0,
         };
         if let Some(script_path) = script_path {
@@ -122,6 +124,7 @@ impl App {
                 self.output_error = output_error;
                 self.error = None;
                 self.meter_state.reset();
+                self.script_view_state.clear_selection();
                 self.last_seek_epoch = 0;
             }
             Err(error) => self.error = Some(error),
@@ -248,6 +251,7 @@ impl eframe::App for App {
                     position,
                     self.follow,
                     self.show_ruby,
+                    &mut self.script_view_state,
                 ) && let Ok(mut transport) = self.transport.lock()
                 {
                     transport.seek_ms(seek_to as i64);

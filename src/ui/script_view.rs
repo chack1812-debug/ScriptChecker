@@ -23,6 +23,116 @@ pub enum LineState {
     Future,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelectionPoint {
+    pub line: usize,
+    pub character: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub start: SelectionPoint,
+    pub end: SelectionPoint,
+}
+
+impl SelectionRange {
+    pub fn new(first: SelectionPoint, second: SelectionPoint) -> Self {
+        if first <= second {
+            Self {
+                start: first,
+                end: second,
+            }
+        } else {
+            Self {
+                start: second,
+                end: first,
+            }
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+}
+
+pub fn selection_text(lines: &[ScriptLine], selection: SelectionRange) -> String {
+    selection_text_refs(&lines.iter().collect::<Vec<_>>(), selection)
+}
+
+fn selection_text_refs(lines: &[&ScriptLine], selection: SelectionRange) -> String {
+    if selection.is_empty() {
+        return String::new();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(line_index, _)| (selection.start.line..=selection.end.line).contains(line_index))
+        .map(|(line_index, line)| selected_line_text(line, line_index, selection))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Default)]
+pub struct ScriptViewState {
+    selection: Option<SelectionRange>,
+    drag_start: Option<(SelectionPoint, Pos2)>,
+}
+
+impl ScriptViewState {
+    pub fn selection(&self) -> Option<SelectionRange> {
+        self.selection
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.drag_start = None;
+    }
+}
+
+fn selected_line_text(line: &ScriptLine, line_index: usize, selection: SelectionRange) -> String {
+    let first = if line_index == selection.start.line {
+        selection.start.character
+    } else {
+        0
+    };
+    let last = if line_index == selection.end.line {
+        selection.end.character
+    } else {
+        usize::MAX
+    };
+    let mut text = String::new();
+    let mut character = 0;
+    for segment in &line.segs {
+        match segment {
+            Seg::Plain(plain) => {
+                for value in plain.chars() {
+                    if (first..=last).contains(&character) {
+                        text.push(value);
+                    }
+                    character += 1;
+                }
+            }
+            Seg::Ruby { base, reading } => {
+                let count = base.chars().count();
+                if character <= last && character + count > first {
+                    text.push('\'');
+                    text.push_str(base);
+                    text.push('|');
+                    text.push_str(reading);
+                    text.push('\'');
+                }
+                character += count;
+            }
+        }
+    }
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] {}: {text}", line.id, line.cast)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WrapToken {
     width: f32,
@@ -100,7 +210,7 @@ pub fn draw_line(
     show_ruby: bool,
 ) -> egui::Response {
     let layout = build_layout(ui, line, content_width(ui), show_ruby);
-    paint_line(ui, line, &layout, state)
+    paint_line(ui, line, &layout, state, None, 0).0
 }
 
 pub fn draw_script(
@@ -110,6 +220,7 @@ pub fn draw_script(
     pos_ms: u64,
     follow: bool,
     show_ruby: bool,
+    view_state: &mut ScriptViewState,
 ) -> Option<u64> {
     let current = current_line(timeline, pos_ms);
     let current_id = ui.id().with("script-current-line");
@@ -131,6 +242,8 @@ pub fn draw_script(
             })
     });
     let mut seek_to = None;
+    let mut hit_lines = Vec::new();
+    let mut line_index = 0;
     egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
         let viewport = viewport.translate(ui.min_rect().min.to_vec2());
         for item in items {
@@ -140,6 +253,8 @@ pub fn draw_script(
                     ui.heading(format!("{id} {name}"));
                 }
                 ScriptItem::Line(line) => {
+                    let this_line_index = line_index;
+                    line_index += 1;
                     let width = content_width(ui);
                     let layout = {
                         let mut cache = cache.lock().expect("script layout cache poisoned");
@@ -166,15 +281,47 @@ pub fn draw_script(
                         egui::vec2(ui.available_width(), layout.height),
                     );
                     let response = if next_rect.intersects(viewport) {
-                        paint_line(ui, line, &layout, state)
+                        let (response, hits) = paint_line(
+                            ui,
+                            line,
+                            &layout,
+                            state,
+                            view_state.selection,
+                            this_line_index,
+                        );
+                        hit_lines.push(HitLine {
+                            line: this_line_index,
+                            timeline_index,
+                            hits,
+                        });
+                        response
                     } else {
-                        ui.allocate_rect(next_rect, Sense::click())
+                        ui.allocate_rect(next_rect, Sense::click_and_drag())
                     };
-                    if response.clicked()
-                        && let Some(index) = timeline_index
-                    {
-                        seek_to = Some(timeline.lines[index].start_ms);
-                    }
+                    response.context_menu(|ui| {
+                        if ui.button("コピー").clicked() {
+                            copy_selection(ui.ctx(), items, view_state.selection);
+                            ui.close_menu();
+                        }
+                        if ui.button("この行をコピー").clicked() {
+                            let all = SelectionRange::new(
+                                SelectionPoint {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                SelectionPoint {
+                                    line: 0,
+                                    character: usize::MAX,
+                                },
+                            );
+                            let lines = [line];
+                            let text = selection_text_refs(&lines, all);
+                            if !text.is_empty() {
+                                ui.ctx().copy_text(text);
+                            }
+                            ui.close_menu();
+                        }
+                    });
                     if follow
                         && (changed || follow_started)
                         && matches!(state, LineState::Current { .. })
@@ -185,7 +332,81 @@ pub fn draw_script(
             }
         }
     });
+    if let Some((point, pointer)) = pointer_hit(ui.ctx(), &hit_lines)
+        && ui
+            .ctx()
+            .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+    {
+        view_state.drag_start = Some((point, pointer));
+        view_state.selection = None;
+    }
+    if let Some((start, origin)) = view_state.drag_start
+        && let Some((end, pointer)) = pointer_hit(ui.ctx(), &hit_lines)
+        && pointer.distance(origin) >= 3.0
+    {
+        view_state.selection = Some(SelectionRange::new(start, end));
+    }
+    if ui
+        .ctx()
+        .input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+        && let Some((start, _)) = view_state.drag_start.take()
+        && view_state.selection.is_none()
+        && let Some(hit) = hit_lines.iter().find(|line| line.line == start.line)
+        && let Some(index) = hit.timeline_index
+    {
+        seek_to = Some(timeline.lines[index].start_ms);
+    }
+    if ui
+        .ctx()
+        .input(|input| input.modifiers.command && input.key_pressed(egui::Key::C))
+    {
+        copy_selection(ui.ctx(), items, view_state.selection);
+    }
     seek_to
+}
+
+struct HitToken {
+    rect: Rect,
+    character: usize,
+}
+
+struct HitLine {
+    line: usize,
+    timeline_index: Option<usize>,
+    hits: Vec<HitToken>,
+}
+
+fn pointer_hit(ctx: &egui::Context, hit_lines: &[HitLine]) -> Option<(SelectionPoint, Pos2)> {
+    let pointer = ctx.input(|input| input.pointer.interact_pos())?;
+    selection_point_at(hit_lines, pointer).map(|point| (point, pointer))
+}
+
+fn selection_point_at(hit_lines: &[HitLine], pointer: Pos2) -> Option<SelectionPoint> {
+    hit_lines.iter().find_map(|line| {
+        line.hits.iter().find_map(|hit| {
+            hit.rect.contains(pointer).then_some(SelectionPoint {
+                line: line.line,
+                character: hit.character,
+            })
+        })
+    })
+}
+
+fn copy_selection(ctx: &egui::Context, items: &[ScriptItem], selection: Option<SelectionRange>) {
+    let Some(selection) = selection else {
+        return;
+    };
+    let lines = items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Line(line) => Some(line),
+            ScriptItem::Scene(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let text = selection_text_refs(&lines, selection);
+    if !text.is_empty() {
+        ctx.copy_text(text);
+    }
 }
 
 fn line_state(
@@ -297,10 +518,12 @@ fn paint_line(
     line: &ScriptLine,
     layout: &LineLayout,
     state: LineState,
-) -> egui::Response {
+    selection: Option<SelectionRange>,
+    line_index: usize,
+) -> (egui::Response, Vec<HitToken>) {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), layout.height),
-        Sense::click(),
+        Sense::click_and_drag(),
     );
     let painter = ui.painter_at(rect);
     if matches!(state, LineState::Current { .. }) {
@@ -313,6 +536,7 @@ fn paint_line(
         FontId::proportional(layout.base_size),
         ui.visuals().strong_text_color(),
     );
+    let mut hits = Vec::new();
     for (row_index, range) in layout.rows.iter().enumerate() {
         let mut x = rect.left() + SPEAKER_WIDTH;
         let base_y = rect.top() + row_index as f32 * layout.row_height + layout.ruby_top;
@@ -322,6 +546,9 @@ fn paint_line(
                 Pos2::new(x, base_y),
                 egui::vec2(token.width, layout.base_size * 1.35),
             );
+            if token_is_selected(selection, line_index, token) {
+                painter.rect_filled(base_rect, 0.0, selection_background(ui.visuals()));
+            }
             if is_current_token(state, token) {
                 painter.rect_filled(base_rect, 0.0, current_token_background(ui.visuals()));
                 painter.line_segment(
@@ -351,10 +578,38 @@ fn paint_line(
                 FontId::proportional(layout.base_size),
                 color,
             );
+            hits.push(HitToken {
+                rect: base_rect,
+                character: token.char_start,
+            });
             x += token.width;
         }
     }
-    response
+    (response, hits)
+}
+
+fn token_is_selected(
+    selection: Option<SelectionRange>,
+    line_index: usize,
+    token: &ScriptToken,
+) -> bool {
+    let Some(selection) = selection else {
+        return false;
+    };
+    if !(selection.start.line..=selection.end.line).contains(&line_index) {
+        return false;
+    }
+    let first = if line_index == selection.start.line {
+        selection.start.character
+    } else {
+        0
+    };
+    let last = if line_index == selection.end.line {
+        selection.end.character
+    } else {
+        usize::MAX
+    };
+    token.char_start <= last && token.char_start + token.char_count > first
 }
 
 fn is_current_token(state: LineState, token: &ScriptToken) -> bool {
@@ -402,6 +657,13 @@ fn current_token_background(visuals: &egui::Visuals) -> Color32 {
         Color32::from_rgb(50, 85, 125)
     }
 }
+fn selection_background(visuals: &egui::Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_rgb(90, 70, 30)
+    } else {
+        Color32::from_rgb(255, 230, 145)
+    }
+}
 fn current_text_color(visuals: &egui::Visuals) -> Color32 {
     let bg = current_token_background(visuals);
     if contrast_ratio(Color32::WHITE, bg) >= contrast_ratio(Color32::BLACK, bg) {
@@ -414,6 +676,180 @@ fn current_text_color(visuals: &egui::Visuals) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_lines() -> Vec<ScriptLine> {
+        vec![
+            ScriptLine {
+                id: "S01-L001".to_owned(),
+                scene: "S01".to_owned(),
+                cast: "蒼真".to_owned(),
+                segs: vec![
+                    Seg::Plain("前".to_owned()),
+                    Seg::Ruby {
+                        base: "東京".to_owned(),
+                        reading: "とうきょう".to_owned(),
+                    },
+                    Seg::Plain("後".to_owned()),
+                ],
+            },
+            ScriptLine {
+                id: "S01-L002".to_owned(),
+                scene: "S01".to_owned(),
+                cast: "大和".to_owned(),
+                segs: vec![Seg::Plain("次の行".to_owned())],
+            },
+        ]
+    }
+
+    #[test]
+    fn copies_ruby_whole_word_across_lines_in_drag_direction() {
+        let selection = SelectionRange::new(
+            SelectionPoint {
+                line: 1,
+                character: 2,
+            },
+            SelectionPoint {
+                line: 0,
+                character: 2,
+            },
+        );
+        assert_eq!(
+            selection_text(&selection_lines(), selection),
+            "[S01-L001] 蒼真: '東京|とうきょう'後\n[S01-L002] 大和: 次の行"
+        );
+    }
+
+    #[test]
+    fn empty_selection_has_no_copyable_text() {
+        let point = SelectionPoint {
+            line: 0,
+            character: 1,
+        };
+        assert_eq!(
+            selection_text(&selection_lines(), SelectionRange::new(point, point)),
+            ""
+        );
+    }
+
+    #[test]
+    fn maps_drag_coordinates_to_the_character_token() {
+        let hits = [HitLine {
+            line: 3,
+            timeline_index: None,
+            hits: vec![
+                HitToken {
+                    rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(10.0, 10.0)),
+                    character: 0,
+                },
+                HitToken {
+                    rect: Rect::from_min_size(Pos2::new(10.0, 0.0), egui::vec2(10.0, 10.0)),
+                    character: 1,
+                },
+            ],
+        }];
+        assert_eq!(
+            selection_point_at(&hits, Pos2::new(15.0, 5.0)),
+            Some(SelectionPoint {
+                line: 3,
+                character: 1,
+            })
+        );
+        assert_eq!(selection_point_at(&hits, Pos2::new(21.0, 5.0)), None);
+    }
+
+    fn selection_timeline() -> Timeline {
+        Timeline {
+            script_sha256: String::new(),
+            duration_ms: 1_000,
+            sample_rate: 48_000,
+            lines: vec![crate::timeline::TimelineLine {
+                id: "S01-L001".to_owned(),
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "abcdef".to_owned(),
+                missing: false,
+            }],
+        }
+    }
+
+    fn selection_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 120.0))),
+            events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn headless_drag_selection_copies_text_with_ctrl_c() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("abcdef".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+
+        for events in [
+            vec![],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(104.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerMoved(Pos2::new(124.0, 15.0))],
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(124.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = ctx.run(selection_input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+                });
+            });
+        }
+
+        assert!(state.selection().is_some());
+        let mut copy_input = selection_input(vec![egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }]);
+        copy_input.modifiers = egui::Modifiers::COMMAND;
+        let output = ctx.run(copy_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+            });
+        });
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text),
+                _ => None,
+            })
+            .expect("Ctrl+C must emit a copy command");
+        assert_eq!(
+            copied,
+            &selection_text(
+                &[match &items[0] {
+                    ScriptItem::Line(line) => line.clone(),
+                    ScriptItem::Scene(_) => unreachable!(),
+                }],
+                state.selection().expect("drag must select text")
+            )
+        );
+        assert!(copied.starts_with("[S01-L001] 蒼真: "));
+    }
 
     #[test]
     fn wraps_tokens_without_stalling_on_wide_tokens() {
