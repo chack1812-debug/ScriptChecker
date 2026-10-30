@@ -75,6 +75,7 @@ pub struct ScriptViewState {
     pressed_timeline: Option<Option<usize>>,
     drag_exceeded_threshold: bool,
     clear_layout_cache: bool,
+    layout_cache: Option<Arc<Mutex<LayoutCache>>>,
     scroll_offset_y: f32,
 }
 
@@ -91,12 +92,32 @@ impl ScriptViewState {
     }
 
     pub fn clear_layout_cache(&mut self) {
-        self.clear_layout_cache = true;
+        if let Some(cache) = &self.layout_cache {
+            cache
+                .lock()
+                .expect("script layout cache poisoned")
+                .entries
+                .clear();
+            self.clear_layout_cache = false;
+        } else {
+            self.clear_layout_cache = true;
+        }
     }
 
     #[cfg(test)]
     fn scroll_offset_y(&self) -> f32 {
         self.scroll_offset_y
+    }
+
+    #[cfg(test)]
+    pub fn layout_cache_entry_count(&self) -> usize {
+        self.layout_cache.as_ref().map_or(0, |cache| {
+            cache
+                .lock()
+                .expect("script layout cache poisoned")
+                .entries
+                .len()
+        })
     }
 }
 
@@ -251,6 +272,7 @@ pub fn draw_script(
                 cache
             })
     });
+    view_state.layout_cache = Some(Arc::clone(&cache));
     if view_state.clear_layout_cache {
         cache
             .lock()
@@ -269,7 +291,10 @@ pub fn draw_script(
         {
             let delta_y = auto_scroll_delta(ui.clip_rect(), pointer);
             if delta_y != 0.0 {
-                ui.scroll_with_delta(egui::vec2(0.0, delta_y));
+                ui.scroll_with_delta_animation(
+                    egui::vec2(0.0, delta_y),
+                    egui::style::ScrollAnimation::none(),
+                );
                 ui.ctx().request_repaint();
             }
         }
@@ -821,6 +846,8 @@ fn token_background(
 mod tests {
     use super::*;
 
+    const EXPECTED_MAX_AUTO_SCROLL_PER_FRAME: f32 = 18.0;
+
     fn selection_lines() -> Vec<ScriptLine> {
         vec![
             ScriptLine {
@@ -930,9 +957,14 @@ mod tests {
     }
 
     fn selection_input(events: Vec<egui::Event>) -> egui::RawInput {
+        selection_input_at_time(events, None)
+    }
+
+    fn selection_input_at_time(events: Vec<egui::Event>, time: Option<f64>) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 120.0))),
             events,
+            time,
             ..Default::default()
         }
     }
@@ -1067,11 +1099,58 @@ mod tests {
         events: Vec<egui::Event>,
         state: &mut ScriptViewState,
     ) -> eframe::egui::FullOutput {
-        ctx.run(selection_input(events), |ctx| {
+        draw_visual_frame_with_ruby(ctx, items, timeline, pos_ms, follow, false, events, state)
+    }
+
+    fn draw_visual_frame_with_ruby(
+        ctx: &egui::Context,
+        items: &[ScriptItem],
+        timeline: &Timeline,
+        pos_ms: u64,
+        follow: bool,
+        show_ruby: bool,
+        events: Vec<egui::Event>,
+        state: &mut ScriptViewState,
+    ) -> eframe::egui::FullOutput {
+        draw_script_frame(
+            ctx, items, timeline, pos_ms, follow, show_ruby, events, state,
+        )
+        .0
+    }
+
+    fn draw_script_frame(
+        ctx: &egui::Context,
+        items: &[ScriptItem],
+        timeline: &Timeline,
+        pos_ms: u64,
+        follow: bool,
+        show_ruby: bool,
+        events: Vec<egui::Event>,
+        state: &mut ScriptViewState,
+    ) -> (eframe::egui::FullOutput, Option<u64>) {
+        draw_script_frame_at_time(
+            ctx, items, timeline, pos_ms, follow, show_ruby, events, None, state,
+        )
+    }
+
+    fn draw_script_frame_at_time(
+        ctx: &egui::Context,
+        items: &[ScriptItem],
+        timeline: &Timeline,
+        pos_ms: u64,
+        follow: bool,
+        show_ruby: bool,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+        state: &mut ScriptViewState,
+    ) -> (eframe::egui::FullOutput, Option<u64>) {
+        let mut seek_to = None;
+        let output = ctx.run(selection_input_at_time(events, time), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = draw_script(ui, items, timeline, pos_ms, follow, false, state);
+                seek_to = draw_script(ui, items, timeline, pos_ms, follow, show_ruby, state);
             });
-        })
+        });
+        (output, seek_to)
     }
 
     #[test]
@@ -1477,6 +1556,7 @@ mod tests {
         let timeline = selection_timeline();
         let mut state = ScriptViewState::default();
         let mut seek_to = None;
+        let mut seek_results = Vec::new();
         for events in [
             vec![],
             vec![egui::Event::PointerButton {
@@ -1510,12 +1590,14 @@ mod tests {
                     seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
                 });
             });
+            seek_results.push(seek_to);
         }
         let menu = ctx.run(selection_input(vec![]), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
             });
         });
+        seek_results.push(seek_to);
         let menu_pos = drawn_text_rect(&menu.shapes, "コピー")
             .expect("context menu must render the copy button")
             .center();
@@ -1532,6 +1614,7 @@ mod tests {
                 });
             },
         );
+        seek_results.push(seek_to);
         let output = ctx.run(
             selection_input(vec![egui::Event::PointerButton {
                 pos: menu_pos,
@@ -1545,6 +1628,7 @@ mod tests {
                 });
             },
         );
+        seek_results.push(seek_to);
         let copied = output
             .platform_output
             .commands
@@ -1571,12 +1655,14 @@ mod tests {
                     });
                 },
             );
+            seek_results.push(seek_to);
         }
         let menu = ctx.run(selection_input(vec![]), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
             });
         });
+        seek_results.push(seek_to);
         let line_copy_pos = drawn_text_rect(&menu.shapes, "この行をコピー")
             .expect("context menu must render the line-copy button")
             .center();
@@ -1594,6 +1680,7 @@ mod tests {
                     });
                 },
             );
+            seek_results.push(seek_to);
             if !pressed {
                 let copied =
                     output
@@ -1608,7 +1695,10 @@ mod tests {
             }
         }
         assert!(state.selection().is_some());
-        assert_eq!(seek_to, None);
+        assert!(
+            seek_results.iter().all(Option::is_none),
+            "context-menu event frames must never seek: {seek_results:?}"
+        );
     }
 
     #[test]
@@ -1617,12 +1707,15 @@ mod tests {
         let items = visual_items(80);
         let timeline = visual_timeline(&items);
         let mut state = ScriptViewState::default();
-        let _ = draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state);
-        let _ = draw_visual_frame(
+        let (_, seek_to) =
+            draw_script_frame(&ctx, &items, &timeline, 0, false, false, vec![], &mut state);
+        assert_eq!(seek_to, None);
+        let (_, seek_to) = draw_script_frame(
             &ctx,
             &items,
             &timeline,
             0,
+            false,
             false,
             vec![egui::Event::PointerButton {
                 pos: Pos2::new(105.0, 15.0),
@@ -1632,23 +1725,98 @@ mod tests {
             }],
             &mut state,
         );
+        assert_eq!(seek_to, None);
+        let mut offsets = Vec::new();
+        let mut end_lines = Vec::new();
         for _ in 0..30 {
-            let _ = draw_visual_frame(
+            let (_, seek_to) = draw_script_frame(
                 &ctx,
                 &items,
                 &timeline,
                 0,
                 false,
+                false,
                 vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
                 &mut state,
             );
+            assert_eq!(seek_to, None, "dragging must never seek");
+            offsets.push(state.scroll_offset_y());
+            end_lines.push(
+                state
+                    .selection()
+                    .expect("drag must extend the selection")
+                    .end
+                    .line,
+            );
+        }
+        for window in offsets.windows(2) {
+            let delta = window[1] - window[0];
+            assert!(
+                delta >= -0.01,
+                "drag scroll must not move backwards: {delta}"
+            );
+            assert!(
+                delta <= EXPECTED_MAX_AUTO_SCROLL_PER_FRAME + 0.1,
+                "drag scroll exceeded its per-frame cap: {delta}"
+            );
+        }
+        for window in end_lines.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "selection end must not move backwards: {window:?}"
+            );
         }
         assert!(state.scroll_offset_y() > 0.0);
-        assert!(
-            state
-                .selection()
-                .is_some_and(|selection| selection.end.line > 0)
+        assert!(end_lines.last().is_some_and(|line| *line > 0));
+
+        let (_, seek_to) = draw_script_frame(
+            &ctx,
+            &items,
+            &timeline,
+            0,
+            false,
+            false,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(124.0, 114.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
         );
+        assert_eq!(seek_to, None, "releasing a selection drag must not seek");
+        for _ in 0..4 {
+            let (_, seek_to) = draw_script_frame(
+                &ctx,
+                &items,
+                &timeline,
+                0,
+                false,
+                false,
+                vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
+                &mut state,
+            );
+            assert_eq!(seek_to, None);
+        }
+        let stopped_offset = state.scroll_offset_y();
+        for _ in 0..3 {
+            let (_, seek_to) = draw_script_frame(
+                &ctx,
+                &items,
+                &timeline,
+                0,
+                false,
+                false,
+                vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
+                &mut state,
+            );
+            assert_eq!(seek_to, None);
+            assert!(
+                (state.scroll_offset_y() - stopped_offset).abs() < 0.01,
+                "auto-scroll must stop after release: before={stopped_offset}, after={} ",
+                state.scroll_offset_y()
+            );
+        }
     }
 
     #[test]
@@ -1821,6 +1989,21 @@ mod tests {
                 assert!(contrast_ratio(readable_text_color(background), background) >= 4.5);
             }
         }
+    }
+
+    #[test]
+    fn clear_layout_cache_removes_the_drawn_layout_entries() {
+        let ctx = egui::Context::default();
+        let items = visual_items(3);
+        let timeline = visual_timeline(&items);
+        let mut state = ScriptViewState::default();
+        let _ = draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state);
+        assert!(
+            state.layout_cache_entry_count() > 0,
+            "drawing must populate the layout cache"
+        );
+        state.clear_layout_cache();
+        assert_eq!(state.layout_cache_entry_count(), 0);
     }
 
     #[test]
