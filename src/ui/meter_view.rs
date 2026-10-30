@@ -150,7 +150,7 @@ fn draw_meter_with_report(
             Align2::LEFT_CENTER,
             format!("{dbfs:.0}"),
             FontId::proportional(9.0),
-            ui.visuals().weak_text_color(),
+            ui.visuals().text_color(),
         ));
         painter.line_segment(
             [
@@ -193,7 +193,7 @@ fn draw_meter_with_report(
             Align2::LEFT_CENTER,
             label,
             FontId::proportional(9.0),
-            ui.visuals().weak_text_color(),
+            ui.visuals().text_color(),
         ));
         for channel in 0..2 {
             let value = state.displayed_levels().get(channel);
@@ -237,6 +237,46 @@ fn draw_line(painter: &egui::Painter, bar: Rect, dbfs: f32, color: Color32) {
 mod tests {
     use super::*;
     use crate::meter::{ChannelMeter, MeterFrame};
+
+    fn test_luminance(color: Color32) -> f32 {
+        let linear = |component: u8| {
+            let component = component as f32 / 255.0;
+            if component <= 0.04045 {
+                component / 12.92
+            } else {
+                ((component + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+
+    fn test_contrast_ratio(left: Color32, right: Color32) -> f32 {
+        let (left, right) = (test_luminance(left), test_luminance(right));
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
+    fn drawn_text_colours(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Color32)> {
+        fn collect(shape: &egui::epaint::Shape, texts: &mut Vec<(String, Color32)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push((
+                    text.galley.job.text.clone(),
+                    text.override_text_color.unwrap_or(text.fallback_color),
+                )),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut texts = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
 
     #[test]
     fn numeric_display_updates_only_after_fifty_milliseconds() {
@@ -362,5 +402,54 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn headless_meter_tick_and_row_label_text_meet_wcag_contrast_in_both_themes() {
+        let required = [
+            "-60", "-48", "-36", "-24", "-12", "0", "RMS", "Peak", "Hold",
+        ];
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            let panel_background = visuals.panel_fill;
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        egui::vec2(METER_PANEL_WIDTH, 240.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut state = MeterViewState::default();
+                        draw_meter(
+                            ui,
+                            &mut state,
+                            &MeterFrame {
+                                channels: vec![ChannelMeter {
+                                    rms_dbfs: -12.0,
+                                    peak_dbfs: -3.0,
+                                }],
+                            },
+                            0.0,
+                        );
+                    });
+                },
+            );
+            let drawn = drawn_text_colours(&output.shapes);
+            for label in required {
+                let foreground = drawn
+                    .iter()
+                    .find_map(|(text, color)| (text == label).then_some(*color))
+                    .unwrap_or_else(|| panic!("{label:?} must be drawn"));
+                assert!(
+                    test_contrast_ratio(foreground, panel_background) >= 4.5,
+                    "{label:?} contrast={} foreground={foreground:?} background={panel_background:?}",
+                    test_contrast_ratio(foreground, panel_background)
+                );
+            }
+        }
     }
 }
