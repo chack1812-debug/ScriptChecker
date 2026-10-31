@@ -78,10 +78,15 @@ pub struct App {
     meter_state: MeterViewState,
     script_view_state: ScriptViewState,
     last_seek_epoch: u64,
+    script_path_was_provided: bool,
+    initial_frame_rendered: bool,
+    startup_file_dialog_shown: bool,
+    last_script_directory: Option<PathBuf>,
 }
 
 impl App {
     pub fn new(script_path: Option<PathBuf>) -> Self {
+        let script_path_was_provided = script_path.is_some();
         let mut app = Self {
             project: None,
             transport: Arc::new(Mutex::new(Transport::new(0, 1))),
@@ -93,6 +98,10 @@ impl App {
             meter_state: MeterViewState::default(),
             script_view_state: ScriptViewState::default(),
             last_seek_epoch: 0,
+            script_path_was_provided,
+            initial_frame_rendered: false,
+            startup_file_dialog_shown: false,
+            last_script_directory: None,
         };
         if let Some(script_path) = script_path {
             app.open_project(script_path);
@@ -101,6 +110,7 @@ impl App {
     }
 
     fn open_project(&mut self, script_path: PathBuf) {
+        self.last_script_directory = script_path.parent().map(Path::to_path_buf);
         match load_project(&script_path) {
             Ok(project) => {
                 let transport = Arc::new(Mutex::new(Transport::new(
@@ -175,9 +185,7 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.follow, "追従");
                 ui.checkbox(&mut self.show_ruby, "ルビ表示");
                 if ui.button("台本を開く").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("台本", &["txt"])
-                        .pick_file()
+                    && let Some(path) = select_script_file(self.last_script_directory.as_deref())
                 {
                     self.open_project(path);
                 }
@@ -263,9 +271,24 @@ impl eframe::App for App {
                     transport.seek_ms(seek_to as i64);
                 }
             } else {
-                ui.label("台本を開くか、起動引数に第N回.txtを指定してください。");
+                ui.label("「台本を開く」から 第N回.txt を選んでください");
             }
         });
+
+        if should_open_startup_file_dialog(
+            self.script_path_was_provided,
+            self.initial_frame_rendered,
+            self.startup_file_dialog_shown,
+        ) {
+            self.startup_file_dialog_shown = true;
+            if let Some(path) = select_script_file(self.last_script_directory.as_deref()) {
+                self.open_project(path);
+            }
+        }
+        if !self.initial_frame_rendered {
+            self.initial_frame_rendered = true;
+            ctx.request_repaint();
+        }
 
         if self
             .transport
@@ -275,6 +298,22 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
     }
+}
+
+fn select_script_file(initial_directory: Option<&Path>) -> Option<PathBuf> {
+    let dialog = rfd::FileDialog::new().add_filter("台本", &["txt"]);
+    match initial_directory {
+        Some(directory) => dialog.set_directory(directory).pick_file(),
+        None => dialog.pick_file(),
+    }
+}
+
+fn should_open_startup_file_dialog(
+    script_path_was_provided: bool,
+    initial_frame_rendered: bool,
+    dialog_was_shown: bool,
+) -> bool {
+    !script_path_was_provided && initial_frame_rendered && !dialog_was_shown
 }
 
 fn is_line_availability_warning(warning: &str) -> bool {
@@ -363,6 +402,22 @@ mod tests {
         assert!(state.show_project);
         assert!(!state.playback_enabled);
         assert_eq!(state.output_error.as_deref(), Some("48000Hz 非対応"));
+    }
+
+    #[test]
+    fn opens_startup_dialog_after_the_initial_frame_without_an_argument() {
+        assert!(!should_open_startup_file_dialog(false, false, false));
+        assert!(should_open_startup_file_dialog(false, true, false));
+    }
+
+    #[test]
+    fn does_not_open_startup_dialog_when_an_argument_was_provided() {
+        assert!(!should_open_startup_file_dialog(true, true, false));
+    }
+
+    #[test]
+    fn does_not_reopen_startup_dialog_after_cancellation() {
+        assert!(!should_open_startup_file_dialog(false, true, true));
     }
 
     #[test]
