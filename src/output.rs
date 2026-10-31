@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -9,6 +12,12 @@ struct OutputCandidate {
     sample_format: cpal::SampleFormat,
     min_sample_rate: u32,
     max_sample_rate: u32,
+}
+
+struct StreamBuildConfig<'a> {
+    device: &'a cpal::Device,
+    config: &'a cpal::StreamConfig,
+    device_channels: u16,
 }
 
 fn select_output_format(
@@ -58,6 +67,10 @@ impl Output {
 }
 
 pub fn start_output(audio: AudioData, transport: Arc<Mutex<Transport>>) -> Result<Output, String> {
+    let output_latency_frames = transport
+        .lock()
+        .map_err(|_| "再生位置を初期化できません".to_owned())?
+        .output_latency_handle();
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -88,6 +101,11 @@ pub fn start_output(audio: AudioData, transport: Arc<Mutex<Transport>>) -> Resul
 
     let config = supported.config();
     let device_channels = config.channels;
+    let stream_config = StreamBuildConfig {
+        device: &device,
+        config: &config,
+        device_channels,
+    };
     let error_message = Arc::new(Mutex::new(None));
     let error_callback = {
         let error_message = Arc::clone(&error_message);
@@ -99,47 +117,42 @@ pub fn start_output(audio: AudioData, transport: Arc<Mutex<Transport>>) -> Resul
     };
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => build_stream(
-            &device,
-            &config,
+            &stream_config,
             audio,
             transport,
-            device_channels,
+            output_latency_frames,
             error_callback,
             |sample| sample,
         ),
         cpal::SampleFormat::I16 => build_stream(
-            &device,
-            &config,
+            &stream_config,
             audio,
             transport,
-            device_channels,
+            output_latency_frames,
             error_callback,
             |sample| (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16,
         ),
         cpal::SampleFormat::U16 => build_stream(
-            &device,
-            &config,
+            &stream_config,
             audio,
             transport,
-            device_channels,
+            output_latency_frames,
             error_callback,
             |sample| ((sample.clamp(-1.0, 1.0) + 1.0) * 0.5 * f32::from(u16::MAX)).round() as u16,
         ),
         cpal::SampleFormat::I32 => build_stream(
-            &device,
-            &config,
+            &stream_config,
             audio,
             transport,
-            device_channels,
+            output_latency_frames,
             error_callback,
             convert_i32,
         ),
         cpal::SampleFormat::U8 => build_stream(
-            &device,
-            &config,
+            &stream_config,
             audio,
             transport,
-            device_channels,
+            output_latency_frames,
             error_callback,
             convert_u8,
         ),
@@ -156,21 +169,26 @@ pub fn start_output(audio: AudioData, transport: Arc<Mutex<Transport>>) -> Resul
 }
 
 fn build_stream<T: cpal::SizedSample + Send + 'static>(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    stream_config: &StreamBuildConfig<'_>,
     audio: AudioData,
     transport: Arc<Mutex<Transport>>,
-    device_channels: u16,
+    output_latency_frames: Arc<std::sync::atomic::AtomicU64>,
     error_callback: impl FnMut(cpal::StreamError) + Send + 'static,
     convert: impl Fn(f32) -> T + Send + 'static,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let audio_channels = audio.channels;
+    let device_channels = stream_config.device_channels;
+    let sample_rate = audio.sample_rate;
     let samples = Arc::clone(&audio.samples);
     let mut rendered = Vec::new();
     let mut mixed = Vec::new();
-    device.build_output_stream(
-        config,
-        move |out: &mut [T], _| {
+    stream_config.device.build_output_stream(
+        stream_config.config,
+        move |out: &mut [T], info| {
+            output_latency_frames.store(
+                output_latency_frames_from_timestamp(info.timestamp(), sample_rate),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let required_samples =
                 out.len() / usize::from(device_channels) * usize::from(audio_channels);
             if rendered.len() < required_samples {
@@ -200,6 +218,21 @@ fn build_stream<T: cpal::SizedSample + Send + 'static>(
         error_callback,
         None,
     )
+}
+
+fn output_latency_frames_from_timestamp(
+    timestamp: cpal::OutputStreamTimestamp,
+    sample_rate: u32,
+) -> u64 {
+    let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) else {
+        return 0;
+    };
+    duration_to_frames(latency, sample_rate)
+}
+
+fn duration_to_frames(duration: Duration, sample_rate: u32) -> u64 {
+    let frames = duration.as_nanos().saturating_mul(u128::from(sample_rate)) / 1_000_000_000;
+    frames.min(u128::from(u64::MAX)) as u64
 }
 
 fn mix_frame_into<'a>(source: &[f32], destination: &'a mut [f32]) -> &'a [f32] {
