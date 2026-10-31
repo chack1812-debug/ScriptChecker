@@ -247,16 +247,16 @@ impl eframe::App for App {
         });
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
-            if let Some(project) = &self.project {
-                if let Some(command) = draw_controls(
+            if let Some(project) = &self.project
+                && let Some(command) = draw_controls(
                     ui,
                     transport_snapshot.control_state(),
                     project.audio.duration_ms(),
                     self.output.is_some() && output_view.playback_enabled,
-                ) && let Ok(mut transport) = self.transport.lock()
-                {
-                    apply_command(&mut transport, command);
-                }
+                )
+                && let Ok(mut transport) = self.transport.lock()
+            {
+                apply_command(&mut transport, command);
             }
         });
         egui::SidePanel::right("meter")
