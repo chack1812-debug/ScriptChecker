@@ -149,6 +149,42 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransportSnapshot {
+    position_ms: u64,
+    mode: Mode,
+    seek_epoch: u64,
+}
+
+impl TransportSnapshot {
+    fn from_transport(transport: &Transport) -> Self {
+        Self {
+            position_ms: transport.position_ms(),
+            mode: transport.mode(),
+            seek_epoch: transport.seek_epoch(),
+        }
+    }
+
+    fn control_state(self) -> ControlState {
+        ControlState {
+            position_ms: self.position_ms,
+            mode: self.mode,
+        }
+    }
+
+    fn meter_position_ms(self) -> u64 {
+        self.position_ms
+    }
+
+    fn script_position_ms(self) -> u64 {
+        self.position_ms
+    }
+
+    fn is_stopped(self) -> bool {
+        self.mode == Mode::Stopped
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         if let Some(message) = self.output.as_ref().and_then(Output::error_message) {
@@ -157,6 +193,15 @@ impl eframe::App for App {
             }
             self.output_error = Some(format!("出力デバイスエラー: {message}"));
         }
+        let transport_snapshot = self
+            .transport
+            .lock()
+            .map(|transport| TransportSnapshot::from_transport(&transport))
+            .unwrap_or(TransportSnapshot {
+                position_ms: 0,
+                mode: Mode::Stopped,
+                seek_epoch: 0,
+            });
         let output_view = project_view_state(self.output_error.as_deref());
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             if let Some(error) = &self.startup_error {
@@ -203,20 +248,9 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
             if let Some(project) = &self.project {
-                let state = self
-                    .transport
-                    .lock()
-                    .map(|transport| ControlState {
-                        position_ms: transport.position_ms(),
-                        mode: transport.mode(),
-                    })
-                    .unwrap_or(ControlState {
-                        position_ms: 0,
-                        mode: Mode::Stopped,
-                    });
                 if let Some(command) = draw_controls(
                     ui,
-                    state,
+                    transport_snapshot.control_state(),
                     project.audio.duration_ms(),
                     self.output.is_some() && output_view.playback_enabled,
                 ) && let Ok(mut transport) = self.transport.lock()
@@ -233,22 +267,11 @@ impl eframe::App for App {
                     if reset_peak {
                         self.meter_state.reset_peak_hold();
                     }
-                    let (position_ms, stopped, seek_epoch) = self
-                        .transport
-                        .lock()
-                        .map(|transport| {
-                            (
-                                transport.position_ms(),
-                                transport.mode() == Mode::Stopped,
-                                transport.seek_epoch(),
-                            )
-                        })
-                        .unwrap_or((0, true, 0));
                     let meter = analyze_meter(
                         &project.audio.samples,
                         project.audio.channels,
                         project.audio.sample_rate,
-                        position_ms as f32 / 1_000.0,
+                        transport_snapshot.meter_position_ms() as f32 / 1_000.0,
                         METER_WINDOW_S,
                     );
                     let now_s = ctx.input(|input| input.time);
@@ -256,8 +279,8 @@ impl eframe::App for App {
                         &mut self.meter_state,
                         &meter,
                         now_s,
-                        stopped || reset_peak,
-                        seek_epoch,
+                        transport_snapshot.is_stopped() || reset_peak,
+                        transport_snapshot.seek_epoch,
                         &mut self.last_seek_epoch,
                     );
                     draw_meter(ui, &mut self.meter_state, &meter, now_s);
@@ -266,16 +289,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(project) = &self.project {
                 ui.heading(project.script_path.display().to_string());
-                let position = self
-                    .transport
-                    .lock()
-                    .map(|transport| transport.position_ms())
-                    .unwrap_or(0);
                 if let Some(seek_to) = draw_script(
                     ui,
                     &project.items,
                     &project.timeline,
-                    position,
+                    transport_snapshot.script_position_ms(),
                     self.follow,
                     self.show_ruby,
                     &mut self.script_view_state,
@@ -303,11 +321,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        if self
-            .transport
-            .lock()
-            .is_ok_and(|transport| transport.mode() != Mode::Stopped)
-        {
+        if !transport_snapshot.is_stopped() {
             ctx.request_repaint();
         }
     }
@@ -447,6 +461,21 @@ mod tests {
         assert_eq!(state.hold(), &[-3.0]);
         assert_eq!(state.displayed_levels(), &seeked_position.channels);
         assert_eq!(last_seek_epoch, 1);
+    }
+
+    #[test]
+    fn all_panels_read_the_same_position_from_the_transport_snapshot() {
+        let snapshot = TransportSnapshot {
+            position_ms: 12_345,
+            mode: Mode::Forward,
+            seek_epoch: 7,
+        };
+
+        assert_eq!(snapshot.control_state().position_ms, 12_345);
+        assert_eq!(snapshot.meter_position_ms(), 12_345);
+        assert_eq!(snapshot.script_position_ms(), 12_345);
+        assert!(!snapshot.is_stopped());
+        assert_eq!(snapshot.seek_epoch, 7);
     }
 
     fn temp_project(name: &str) -> std::path::PathBuf {
