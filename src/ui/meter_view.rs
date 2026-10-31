@@ -169,7 +169,7 @@ fn draw_meter_with_report(
                 Pos2::new(rect.left() + tick_width, y),
                 Pos2::new(bar_rect.right(), y),
             ],
-            Stroke::new(0.5, Color32::DARK_GRAY),
+            Stroke::new(0.5_f32, Color32::DARK_GRAY),
         );
     }
     for channel in 0..2 {
@@ -241,7 +241,7 @@ fn draw_line(painter: &egui::Painter, bar: Rect, dbfs: f32, color: Color32) {
     let y = bar.bottom() - meter_y_fraction(dbfs) * bar.height();
     painter.line_segment(
         [Pos2::new(bar.left(), y), Pos2::new(bar.right(), y)],
-        Stroke::new(1.5, color),
+        Stroke::new(1.5_f32, color),
     );
 }
 

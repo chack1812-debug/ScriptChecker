@@ -709,7 +709,7 @@ fn paint_line(
                         Pos2::new(base_rect.left(), base_rect.bottom()),
                         Pos2::new(base_rect.right(), base_rect.bottom()),
                     ],
-                    Stroke::new(1.0, current_text_color(ui.visuals())),
+                    Stroke::new(1.0_f32, current_text_color(ui.visuals())),
                 );
             }
             if let Some(ruby) = &token.ruby {
