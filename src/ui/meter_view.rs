@@ -2,7 +2,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke};
 
 use crate::meter::MeterFrame;
 
-pub const METER_WINDOW_S: f32 = 0.05;
+pub const METER_WINDOW_S: f32 = 0.3;
 pub const METER_PANEL_WIDTH: f32 = 136.0;
 pub const NUMERIC_DISPLAY_INTERVAL_S: f64 = 0.05;
 const TICK_LABEL_PADDING: f32 = 6.0;
@@ -26,11 +26,15 @@ impl MeterViewState {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.peak_hold_dbfs.clear();
+    pub fn reset_for_audio(&mut self) {
+        self.reset_peak_hold();
         self.displayed_levels.clear();
-        self.displayed_hold_dbfs.clear();
         self.last_numeric_update_s = None;
+    }
+
+    pub fn reset_peak_hold(&mut self) {
+        self.peak_hold_dbfs.clear();
+        self.displayed_hold_dbfs.clear();
     }
 
     pub fn hold(&self) -> &[f32] {
@@ -38,13 +42,21 @@ impl MeterViewState {
     }
 
     pub fn update_numeric_display(&mut self, meter: &MeterFrame, now_s: f64) -> bool {
+        self.update_numeric_display_when(meter, now_s, false)
+    }
+
+    pub fn refresh_numeric_display(&mut self, meter: &MeterFrame, now_s: f64) {
+        let _ = self.update_numeric_display_when(meter, now_s, true);
+    }
+
+    fn update_numeric_display_when(&mut self, meter: &MeterFrame, now_s: f64, force: bool) -> bool {
         self.update(meter);
-        if !should_update_numeric_display(self.last_numeric_update_s, now_s) {
+        if !force && !should_update_numeric_display(self.last_numeric_update_s, now_s) {
             return false;
         }
         self.displayed_levels.clone_from(&meter.channels);
         self.displayed_hold_dbfs.clone_from(&self.peak_hold_dbfs);
-        self.last_numeric_update_s = Some(now_s);
+        self.last_numeric_update_s = now_s.is_finite().then_some(now_s);
         true
     }
 
@@ -305,6 +317,27 @@ mod tests {
     }
 
     #[test]
+    fn reloading_audio_and_reset_peak_clear_peak_hold() {
+        let meter = MeterFrame {
+            channels: vec![ChannelMeter {
+                rms_dbfs: -12.0,
+                peak_dbfs: -3.0,
+            }],
+        };
+        let mut state = MeterViewState::default();
+
+        state.update_numeric_display(&meter, 0.0);
+        state.reset_peak_hold();
+        assert!(state.hold().is_empty());
+        assert!(state.displayed_hold().is_empty());
+
+        state.update_numeric_display(&meter, 0.05);
+        state.reset_for_audio();
+        assert!(state.hold().is_empty());
+        assert!(state.displayed_levels().is_empty());
+    }
+
+    #[test]
     fn maps_dbfs_and_holds_channel_peaks() {
         assert_eq!(meter_y_fraction(-60.0), 0.0);
         assert_eq!(meter_y_fraction(0.0), 1.0);
@@ -326,7 +359,7 @@ mod tests {
             }],
         });
         assert_eq!(state.hold(), &[-10.0]);
-        state.reset();
+        state.reset_peak_hold();
         assert!(state.hold().is_empty());
     }
 

@@ -7,7 +7,7 @@ use eframe::egui;
 
 use crate::{
     audio::{AudioData, load_wav},
-    meter::analyze_meter,
+    meter::{MeterFrame, analyze_meter},
     output::{Output, start_output},
     script::{ScriptItem, parse_script},
     timeline::{Timeline, Warnings, check_consistency, parse_timeline},
@@ -133,7 +133,7 @@ impl App {
                 self.output = output;
                 self.output_error = output_error;
                 self.error = None;
-                self.meter_state.reset();
+                self.meter_state.reset_for_audio();
                 self.script_view_state.clear_selection();
                 self.script_view_state.clear_layout_cache();
                 self.last_seek_epoch = 0;
@@ -220,6 +220,10 @@ impl eframe::App for App {
             .exact_width(METER_PANEL_WIDTH)
             .show(ctx, |ui| {
                 if let Some(project) = &self.project {
+                    let reset_peak = ui.small_button("Reset peak").clicked();
+                    if reset_peak {
+                        self.meter_state.reset_peak_hold();
+                    }
                     let (position_ms, stopped, seek_epoch) = self
                         .transport
                         .lock()
@@ -231,10 +235,6 @@ impl eframe::App for App {
                             )
                         })
                         .unwrap_or((0, true, 0));
-                    if stopped || seek_epoch != self.last_seek_epoch {
-                        self.meter_state.reset();
-                        self.last_seek_epoch = seek_epoch;
-                    }
                     let meter = analyze_meter(
                         &project.audio.samples,
                         project.audio.channels,
@@ -242,12 +242,16 @@ impl eframe::App for App {
                         position_ms as f32 / 1_000.0,
                         METER_WINDOW_S,
                     );
-                    draw_meter(
-                        ui,
+                    let now_s = ctx.input(|input| input.time);
+                    update_meter_state_for_transport(
                         &mut self.meter_state,
                         &meter,
-                        ctx.input(|input| input.time),
+                        now_s,
+                        stopped || reset_peak,
+                        seek_epoch,
+                        &mut self.last_seek_epoch,
                     );
+                    draw_meter(ui, &mut self.meter_state, &meter, now_s);
                 }
             });
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -300,6 +304,23 @@ impl eframe::App for App {
     }
 }
 
+fn update_meter_state_for_transport(
+    meter_state: &mut MeterViewState,
+    meter: &MeterFrame,
+    now_s: f64,
+    force_current_position: bool,
+    seek_epoch: u64,
+    last_seek_epoch: &mut u64,
+) {
+    let refresh_current_position = force_current_position || seek_epoch != *last_seek_epoch;
+    *last_seek_epoch = seek_epoch;
+    if refresh_current_position {
+        meter_state.refresh_numeric_display(meter, now_s);
+    } else {
+        meter_state.update_numeric_display(meter, now_s);
+    }
+}
+
 fn select_script_file(initial_directory: Option<&Path>) -> Option<PathBuf> {
     let dialog = rfd::FileDialog::new().add_filter("台本", &["txt"]);
     match initial_directory {
@@ -345,7 +366,79 @@ fn project_view_state(output_error: Option<&str>) -> ProjectViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meter::{ChannelMeter, MeterFrame};
     use hound::{SampleFormat, WavSpec, WavWriter};
+
+    fn meter(rms_dbfs: f32, peak_dbfs: f32) -> MeterFrame {
+        MeterFrame {
+            channels: vec![ChannelMeter {
+                rms_dbfs,
+                peak_dbfs,
+            }],
+        }
+    }
+
+    #[test]
+    fn stopping_keeps_the_meter_peak_hold() {
+        let loud = meter(-12.0, -3.0);
+        let stopped_position = meter(-42.0, -30.0);
+        let mut state = MeterViewState::default();
+        let mut last_seek_epoch = 0;
+
+        state.update_numeric_display(&loud, 0.0);
+        update_meter_state_for_transport(
+            &mut state,
+            &stopped_position,
+            0.01,
+            true,
+            0,
+            &mut last_seek_epoch,
+        );
+
+        assert_eq!(state.hold(), &[-3.0]);
+    }
+
+    #[test]
+    fn stopping_refreshes_meter_numbers_at_the_current_position() {
+        let before_stop = meter(-42.0, -30.0);
+        let stopped_position = meter(-12.0, -3.0);
+        let mut state = MeterViewState::default();
+        let mut last_seek_epoch = 0;
+
+        state.update_numeric_display(&before_stop, 0.0);
+        update_meter_state_for_transport(
+            &mut state,
+            &stopped_position,
+            0.01,
+            true,
+            0,
+            &mut last_seek_epoch,
+        );
+
+        assert_eq!(state.displayed_levels(), &stopped_position.channels);
+    }
+
+    #[test]
+    fn seeking_keeps_the_meter_peak_hold() {
+        let loud = meter(-12.0, -3.0);
+        let seeked_position = meter(-36.0, -24.0);
+        let mut state = MeterViewState::default();
+        let mut last_seek_epoch = 0;
+
+        state.update_numeric_display(&loud, 0.0);
+        update_meter_state_for_transport(
+            &mut state,
+            &seeked_position,
+            0.01,
+            false,
+            1,
+            &mut last_seek_epoch,
+        );
+
+        assert_eq!(state.hold(), &[-3.0]);
+        assert_eq!(state.displayed_levels(), &seeked_position.channels);
+        assert_eq!(last_seek_epoch, 1);
+    }
 
     fn temp_project(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
