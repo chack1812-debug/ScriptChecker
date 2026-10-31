@@ -73,6 +73,7 @@ pub struct App {
     output: Option<Output>,
     follow: bool,
     show_ruby: bool,
+    startup_error: Option<String>,
     error: Option<String>,
     output_error: Option<String>,
     meter_state: MeterViewState,
@@ -86,6 +87,10 @@ pub struct App {
 
 impl App {
     pub fn new(script_path: Option<PathBuf>) -> Self {
+        Self::with_startup_error(script_path, None)
+    }
+
+    pub fn with_startup_error(script_path: Option<PathBuf>, startup_error: Option<String>) -> Self {
         let script_path_was_provided = script_path.is_some();
         let mut app = Self {
             project: None,
@@ -93,6 +98,7 @@ impl App {
             output: None,
             follow: true,
             show_ruby: true,
+            startup_error,
             error: None,
             output_error: None,
             meter_state: MeterViewState::default(),
@@ -153,6 +159,9 @@ impl eframe::App for App {
         }
         let output_view = project_view_state(self.output_error.as_deref());
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
+            if let Some(error) = &self.startup_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
@@ -495,6 +504,16 @@ mod tests {
         assert!(state.show_project);
         assert!(!state.playback_enabled);
         assert_eq!(state.output_error.as_deref(), Some("48000Hz 非対応"));
+    }
+
+    #[test]
+    fn keeps_startup_font_error_for_status_display() {
+        let app = App::with_startup_error(None, Some("日本語フォントが見つかりません".to_owned()));
+
+        assert_eq!(
+            app.startup_error.as_deref(),
+            Some("日本語フォントが見つかりません")
+        );
     }
 
     #[test]
