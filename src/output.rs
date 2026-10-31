@@ -224,10 +224,14 @@ fn output_latency_frames_from_timestamp(
     timestamp: cpal::OutputStreamTimestamp,
     sample_rate: u32,
 ) -> u64 {
-    let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) else {
-        return 0;
-    };
-    duration_to_frames(latency, sample_rate)
+    output_latency_frames(
+        timestamp.playback.duration_since(&timestamp.callback),
+        sample_rate,
+    )
+}
+
+fn output_latency_frames(latency: Option<Duration>, sample_rate: u32) -> u64 {
+    latency.map_or(0, |latency| duration_to_frames(latency, sample_rate))
 }
 
 fn duration_to_frames(duration: Duration, sample_rate: u32) -> u64 {
@@ -312,5 +316,22 @@ mod tests {
         assert_eq!(convert_u8(-1.0), 0);
         assert_eq!(convert_u8(0.0), 128);
         assert_eq!(convert_u8(1.0), u8::MAX);
+    }
+
+    #[test]
+    fn converts_durations_and_output_latencies_to_frames() {
+        assert_eq!(
+            duration_to_frames(Duration::from_millis(125), 48_000),
+            6_000
+        );
+        assert_eq!(
+            duration_to_frames(Duration::from_nanos(1_500_000_000), 44_100),
+            66_150
+        );
+        assert_eq!(output_latency_frames(None, 48_000), 0);
+        assert_eq!(
+            output_latency_frames(Some(Duration::from_millis(10)), 48_000),
+            480
+        );
     }
 }
