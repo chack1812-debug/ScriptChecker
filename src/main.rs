@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 fn main() {
     let script_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     let options = eframe::NativeOptions::default();
