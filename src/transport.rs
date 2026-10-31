@@ -19,6 +19,7 @@ pub struct Transport {
     total_frames: u64,
     sample_rate: u32,
     mode: Mode,
+    run_origin_frames: f64,
     seek_epoch: u64,
     output_latency_frames: Arc<AtomicU64>,
 }
@@ -30,6 +31,7 @@ impl Transport {
             total_frames,
             sample_rate,
             mode: Mode::Stopped,
+            run_origin_frames: 0.0,
             seek_epoch: 0,
             output_latency_frames: Arc::new(AtomicU64::new(0)),
         }
@@ -40,13 +42,14 @@ impl Transport {
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
-        if mode == Mode::Stopped && self.mode != Mode::Stopped {
-            let audible = self.audible_position_frames();
-            if self.pos_frames != audible {
-                self.pos_frames = audible;
-                self.seek_epoch = self.seek_epoch.wrapping_add(1);
-            }
+        if mode == self.mode {
+            return;
         }
+        let audible = self.audible_position_frames();
+        if mode == Mode::Stopped {
+            self.pos_frames = audible;
+        }
+        self.run_origin_frames = audible;
         self.mode = mode;
     }
 
@@ -73,6 +76,7 @@ impl Transport {
             self.pos_frames = clamped;
             self.seek_epoch = self.seek_epoch.wrapping_add(1);
         }
+        self.run_origin_frames = requested.clamp(0.0, self.total_frames as f64);
     }
 
     pub fn seek_epoch(&self) -> u64 {
@@ -102,8 +106,7 @@ impl Transport {
 
         for output_frame in out.chunks_exact_mut(channels) {
             if self.at_boundary() {
-                self.mode = Mode::Stopped;
-                self.clamp_position();
+                self.stop_at_boundary();
                 break;
             }
             let source_frame = if matches!(self.mode, Mode::Rewind)
@@ -115,15 +118,13 @@ impl Transport {
             };
             let source_start = source_frame * channels;
             let Some(source) = samples.get(source_start..source_start + channels) else {
-                self.mode = Mode::Stopped;
-                self.clamp_position();
+                self.stop_at_boundary();
                 break;
             };
             output_frame.copy_from_slice(source);
             self.advance();
             if self.at_boundary() {
-                self.mode = Mode::Stopped;
-                self.clamp_position();
+                self.stop_at_boundary();
             }
         }
     }
@@ -149,6 +150,12 @@ impl Transport {
         self.pos_frames = self.pos_frames.clamp(0.0, self.total_frames as f64);
     }
 
+    fn stop_at_boundary(&mut self) {
+        self.clamp_position();
+        self.run_origin_frames = self.pos_frames;
+        self.mode = Mode::Stopped;
+    }
+
     fn audible_position_frames(&self) -> f64 {
         let latency = self.output_latency_frames.load(Ordering::Relaxed) as f64;
         let compensated = match self.mode {
@@ -157,12 +164,21 @@ impl Transport {
             Mode::Rewind => self.pos_frames + latency * FAST_RATE,
             Mode::Stopped => self.pos_frames,
         };
-        compensated.clamp(0.0, self.total_frames as f64)
+        match self.mode {
+            Mode::Play | Mode::Forward => compensated.max(self.run_origin_frames),
+            Mode::Rewind => compensated.min(self.run_origin_frames),
+            Mode::Stopped => compensated,
+        }
+        .clamp(0.0, self.total_frames as f64)
     }
 
     fn raw_position_for_audible_position(&self, audible_position: f64) -> f64 {
+        self.raw_position_for_audible_position_in_mode(audible_position, self.mode)
+    }
+
+    fn raw_position_for_audible_position_in_mode(&self, audible_position: f64, mode: Mode) -> f64 {
         let latency = self.output_latency_frames.load(Ordering::Relaxed) as f64;
-        let rendered = match self.mode {
+        let rendered = match mode {
             Mode::Play => audible_position + latency,
             Mode::Forward => audible_position + latency * FAST_RATE,
             Mode::Rewind => audible_position - latency * FAST_RATE,
@@ -284,11 +300,71 @@ mod tests {
         transport.seek_ms(1_050);
         transport.set_output_latency_frames(100);
         transport.set_mode(Mode::Play);
-        assert_eq!(current_line(&timeline, transport.position_ms()), Some(0));
+        assert_eq!(transport.position_ms(), 1_050);
+        assert_eq!(current_line(&timeline, transport.position_ms()), Some(1));
 
         transport.set_mode(Mode::Stopped);
-        assert_eq!(transport.position_ms(), 950);
-        assert_eq!(current_line(&timeline, transport.position_ms()), Some(0));
+        assert_eq!(transport.position_ms(), 1_050);
+        assert_eq!(current_line(&timeline, transport.position_ms()), Some(1));
+    }
+
+    #[test]
+    fn stopping_immediately_after_play_keeps_the_start_position_without_accumulating_drift() {
+        let mut transport = Transport::new(5_000, 1_000);
+        transport.seek_ms(1_000);
+        transport.set_output_latency_frames(100);
+
+        for _ in 0..3 {
+            transport.set_mode(Mode::Play);
+            assert_eq!(transport.position_ms(), 1_000);
+            transport.set_mode(Mode::Stopped);
+            assert_eq!(transport.position_ms(), 1_000);
+        }
+    }
+
+    #[test]
+    fn changing_playback_direction_keeps_the_current_audible_position() {
+        let samples = stereo_frames(5_000);
+        let mut transport = Transport::new(5_000, 1_000);
+        transport.seek_ms(1_000);
+        transport.set_output_latency_frames(100);
+        transport.set_mode(Mode::Play);
+        let mut output = vec![0.0; 400];
+        transport.render(&samples, 2, &mut output);
+        let audible = transport.position_ms();
+        assert_eq!(audible, 1_100);
+
+        transport.set_mode(Mode::Forward);
+        assert_eq!(transport.position_ms(), audible);
+        transport.set_mode(Mode::Rewind);
+        assert_eq!(transport.position_ms(), audible);
+    }
+
+    #[test]
+    fn fast_forward_compensates_latency_at_the_fast_rate() {
+        let samples = stereo_frames(5_000);
+        let mut transport = Transport::new(5_000, 1_000);
+        transport.seek_ms(1_000);
+        transport.set_output_latency_frames(100);
+        transport.set_mode(Mode::Forward);
+        let mut output = vec![0.0; 200];
+
+        transport.render(&samples, 2, &mut output);
+        assert_eq!(transport.position_ms(), 1_000);
+        transport.render(&samples, 2, &mut output);
+        assert_eq!(transport.position_ms(), 1_400);
+    }
+
+    #[test]
+    fn stopping_does_not_advance_the_seek_epoch() {
+        let mut transport = Transport::new(5_000, 1_000);
+        transport.seek_ms(1_000);
+        let seek_epoch = transport.seek_epoch();
+        transport.set_output_latency_frames(100);
+        transport.set_mode(Mode::Play);
+        transport.set_mode(Mode::Stopped);
+
+        assert_eq!(transport.seek_epoch(), seek_epoch);
     }
 
     #[test]
@@ -299,19 +375,21 @@ mod tests {
         transport.seek_ms(650);
         transport.set_output_latency_frames(100);
         transport.set_mode(Mode::Rewind);
+        let mut output = vec![0.0; 250];
+        transport.render(&stereo_frames(2_000), 2, &mut output);
         transport.set_mode(Mode::Stopped);
-        assert_eq!(transport.position_ms(), 1_050);
-        assert_eq!(current_line(&timeline, transport.position_ms()), Some(1));
+        assert_eq!(transport.position_ms(), 550);
+        assert_eq!(current_line(&timeline, transport.position_ms()), Some(0));
 
         transport.seek_ms(50);
         transport.set_mode(Mode::Play);
         transport.set_mode(Mode::Stopped);
-        assert_eq!(transport.position_ms(), 0);
+        assert_eq!(transport.position_ms(), 50);
 
         transport.seek_ms(1_950);
         transport.set_mode(Mode::Rewind);
         transport.set_mode(Mode::Stopped);
-        assert_eq!(transport.position_ms(), 2_000);
+        assert_eq!(transport.position_ms(), 1_950);
     }
 
     #[test]
@@ -321,10 +399,10 @@ mod tests {
         transport.seek_ms(15_000);
         transport.set_output_latency_frames(1_000);
         transport.set_mode(Mode::Play);
-        assert_eq!(transport.position_ms(), 14_000);
+        assert_eq!(transport.position_ms(), 15_000);
 
         transport.skip_ms(-(SKIP_MS as i64));
-        assert_eq!(transport.position_ms(), 4_000);
+        assert_eq!(transport.position_ms(), 5_000);
 
         transport.seek_ms(10_000);
         assert_eq!(transport.position_ms(), 10_000);
