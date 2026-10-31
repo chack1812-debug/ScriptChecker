@@ -5,3 +5,6 @@ target/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Beads(工程管理の状態。リポジトリには含めない)
+.beads/
