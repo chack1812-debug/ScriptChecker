@@ -254,6 +254,17 @@ pub fn draw_script(
     show_ruby: bool,
     view_state: &mut ScriptViewState,
 ) -> Option<u64> {
+    let focus_lost = ui.ctx().input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+    });
+    if focus_lost {
+        view_state.drag_start = None;
+        view_state.pressed_timeline = None;
+        view_state.drag_exceeded_threshold = false;
+    }
     let current = current_line(timeline, pos_ms);
     let current_id = ui.id().with("script-current-line");
     let follow_id = ui.id().with("script-follow");
@@ -288,6 +299,7 @@ pub fn draw_script(
     let scroll_output = egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
         let viewport = viewport.translate(ui.min_rect().min.to_vec2());
         if view_state.drag_start.is_some()
+            && ui.ctx().input(|input| input.pointer.primary_down())
             && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
         {
             let delta_y = auto_scroll_delta(ui.clip_rect(), pointer);
@@ -413,6 +425,7 @@ pub fn draw_script(
         }
     }
     if let Some((start, origin)) = view_state.drag_start
+        && ui.ctx().input(|input| input.pointer.primary_down())
         && let Some(pointer) = ui.ctx().input(|input| input.pointer.interact_pos())
         && pointer.distance(origin) >= 3.0
     {
@@ -1925,6 +1938,56 @@ mod tests {
                 "auto-scroll must stop after release: before={stopped_offset}, after={} ",
                 state.scroll_offset_y()
             );
+        }
+    }
+
+    #[test]
+    fn focus_loss_ends_drag_without_changing_the_selection() {
+        let ctx = egui::Context::default();
+        let items = visual_items(80);
+        let timeline = visual_timeline(&items);
+        let mut state = ScriptViewState::default();
+        let frame = ScriptFrame::new(&items, &timeline, 0, false, false);
+
+        let _ = draw_script_frame(&ctx, frame, vec![], &mut state);
+        let _ = draw_script_frame(
+            &ctx,
+            frame,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(105.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        let _ = draw_script_frame(
+            &ctx,
+            frame,
+            vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
+            &mut state,
+        );
+        let selection = state.selection().expect("drag must create a selection");
+
+        let _ = draw_script_frame(
+            &ctx,
+            frame,
+            vec![egui::Event::WindowFocused(false)],
+            &mut state,
+        );
+        assert!(state.drag_start.is_none());
+        assert_eq!(state.selection(), Some(selection));
+        let scroll_offset = state.scroll_offset_y();
+
+        for _ in 0..3 {
+            let _ = draw_script_frame(
+                &ctx,
+                frame,
+                vec![egui::Event::PointerMoved(Pos2::new(124.0, 114.0))],
+                &mut state,
+            );
+            assert_eq!(state.selection(), Some(selection));
+            assert!((state.scroll_offset_y() - scroll_offset).abs() < 0.01);
         }
     }
 
