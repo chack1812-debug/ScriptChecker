@@ -11,13 +11,13 @@ YouTube 番組制作の公開前チェックを助ける、Windows 向けのデ�
 
 ## 必要なもの
 
-台本ファイルと同じフォルダに、次のファイルがあることを前提にします。
+台本ファイルと同じフォルダに、以下が必要です。
 
-| ファイル | 内容 |
-|---|---|
-| `第N回.txt` | 台本。`[S01-L001] 話者:台詞` の行と `#paragraph[S01] 見出し` を含む |
-| `full_dialogue.wav` | 全体の音声 |
-| `timeline/timeline.json` | 各行の開始・終了時刻(Script2Video の `build` が作る) |
+```
+第N回.txt                 台本。[S01-L001] 話者:台詞 の行と #paragraph[S01] 見出し を含む
+full_dialogue.wav         全体の音声
+timeline/timeline.json    各行の開始・終了時刻(Script2Video の build が作る)
+```
 
 ビルドには Rust(Edition 2024 に対応した版)が必要です。
 
