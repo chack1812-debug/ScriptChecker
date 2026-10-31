@@ -407,20 +407,21 @@ pub fn draw_script(
         }
     });
     view_state.scroll_offset_y = scroll_output.state.offset.y;
+    let script_rect = scroll_output.inner_rect;
     let pointer_pos = ui.ctx().input(|input| input.pointer.interact_pos());
-    let pointer_is_on_script_layer =
-        pointer_pos.is_some_and(|pos| ui.ctx().layer_id_at(pos) == Some(ui.layer_id()));
-    if pointer_is_on_script_layer
+    let pointer_is_on_script = pointer_pos.is_some_and(|pos| script_rect.contains(pos));
+    if pointer_is_on_script
         && ui
             .ctx()
             .input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
-        && let Some(hit) = line_at_pointer(ui.ctx(), &hit_lines)
+        && let Some(hit) = line_at_pointer(ui.ctx(), &hit_lines, script_rect)
     {
         view_state.selection = None;
         view_state.drag_start = None;
         view_state.pressed_timeline = Some(hit.timeline_index);
         view_state.drag_exceeded_threshold = false;
-        if let Some((point, pointer)) = pointer_hit_or_line_start(ui.ctx(), &hit_lines) {
+        if let Some((point, pointer)) = pointer_hit_or_line_start(ui.ctx(), &hit_lines, script_rect)
+        {
             view_state.drag_start = Some((point, pointer));
         }
     }
@@ -439,9 +440,11 @@ pub fn draw_script(
         .input(|input| input.pointer.button_released(egui::PointerButton::Primary))
     {
         view_state.drag_start = None;
-        if !view_state.drag_exceeded_threshold
+        let pressed_timeline = view_state.pressed_timeline.take();
+        if pointer_is_on_script
+            && !view_state.drag_exceeded_threshold
             && view_state.selection.is_none()
-            && let Some(Some(index)) = view_state.pressed_timeline.take()
+            && let Some(Some(index)) = pressed_timeline
         {
             seek_to = Some(timeline.lines[index].start_ms);
         }
@@ -471,20 +474,33 @@ struct HitLine {
     hits: Vec<HitToken>,
 }
 
-fn line_at_pointer<'a>(ctx: &egui::Context, hit_lines: &'a [HitLine]) -> Option<&'a HitLine> {
+fn line_at_pointer<'a>(
+    ctx: &egui::Context,
+    hit_lines: &'a [HitLine],
+    visible_rect: Rect,
+) -> Option<&'a HitLine> {
     let pointer = ctx.input(|input| input.pointer.interact_pos())?;
-    hit_lines.iter().find(|line| line.rect.contains(pointer))
+    if !visible_rect.contains(pointer) {
+        return None;
+    }
+    hit_lines
+        .iter()
+        .find(|line| line.rect.intersect(visible_rect).contains(pointer))
 }
 
 fn pointer_hit_or_line_start(
     ctx: &egui::Context,
     hit_lines: &[HitLine],
+    visible_rect: Rect,
 ) -> Option<(SelectionPoint, Pos2)> {
     let pointer = ctx.input(|input| input.pointer.interact_pos())?;
-    let point = selection_point_at(hit_lines, pointer).or_else(|| {
+    if !visible_rect.contains(pointer) {
+        return None;
+    }
+    let point = selection_point_at_in_rect(hit_lines, pointer, visible_rect).or_else(|| {
         hit_lines
             .iter()
-            .find(|line| line.rect.contains(pointer))
+            .find(|line| line.rect.intersect(visible_rect).contains(pointer))
             .and_then(|line| {
                 line.hits.first().map(|hit| SelectionPoint {
                     line: line.line,
@@ -493,6 +509,24 @@ fn pointer_hit_or_line_start(
             })
     })?;
     Some((point, pointer))
+}
+
+fn selection_point_at_in_rect(
+    hit_lines: &[HitLine],
+    pointer: Pos2,
+    visible_rect: Rect,
+) -> Option<SelectionPoint> {
+    hit_lines.iter().find_map(|line| {
+        line.hits.iter().find_map(|hit| {
+            hit.rect
+                .intersect(visible_rect)
+                .contains(pointer)
+                .then_some(SelectionPoint {
+                    line: line.line,
+                    character: hit.character,
+                })
+        })
+    })
 }
 
 fn selection_point_at_or_nearest(hit_lines: &[HitLine], pointer: Pos2) -> Option<SelectionPoint> {
@@ -1266,6 +1300,34 @@ mod tests {
         (output, seek_to)
     }
 
+    fn draw_script_frame_with_controls(
+        ctx: &egui::Context,
+        frame: ScriptFrame<'_>,
+        events: Vec<egui::Event>,
+        state: &mut ScriptViewState,
+    ) -> (eframe::egui::FullOutput, Option<u64>) {
+        let mut seek_to = None;
+        let output = ctx.run(selection_input(events), |ctx| {
+            egui::TopBottomPanel::bottom("test-controls")
+                .exact_height(40.0)
+                .show(ctx, |ui| {
+                    let _ = ui.button("操作");
+                });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                seek_to = draw_script(
+                    ui,
+                    frame.items,
+                    frame.timeline,
+                    frame.pos_ms,
+                    frame.follow,
+                    frame.show_ruby,
+                    state,
+                );
+            });
+        });
+        (output, seek_to)
+    }
+
     #[test]
     fn headless_script_draws_text_at_start_middle_end_and_follow_position() {
         let ctx = egui::Context::default();
@@ -1317,6 +1379,111 @@ mod tests {
                 "{name} viewport must paint text"
             );
         }
+    }
+
+    #[test]
+    fn headless_controls_click_does_not_change_script_selection() {
+        let ctx = egui::Context::default();
+        let items = visual_items(40);
+        let timeline = visual_timeline(&items);
+        let selection = SelectionRange::new(
+            SelectionPoint {
+                line: 0,
+                character: 0,
+            },
+            SelectionPoint {
+                line: 0,
+                character: 2,
+            },
+        );
+        let mut state = ScriptViewState {
+            selection: Some(selection),
+            ..Default::default()
+        };
+        let frame = ScriptFrame::new(&items, &timeline, 0, false, false);
+
+        let _ = draw_script_frame_with_controls(&ctx, frame, vec![], &mut state);
+        let _ = draw_script_frame_with_controls(
+            &ctx,
+            frame,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(150.0, 40.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -60.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut state,
+        );
+        assert!(state.scroll_offset_y() > 0.0, "test must scroll the script");
+
+        let (_, seek_to) = draw_script_frame_with_controls(
+            &ctx,
+            frame,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(150.0, 100.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        assert_eq!(seek_to, None);
+        assert_eq!(state.selection(), Some(selection));
+
+        let (_, seek_to) = draw_script_frame_with_controls(
+            &ctx,
+            frame,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(150.0, 100.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        assert_eq!(seek_to, None);
+        assert_eq!(state.selection(), Some(selection));
+    }
+
+    #[test]
+    fn headless_visible_script_click_seeks_to_its_line() {
+        let ctx = egui::Context::default();
+        let items = vec![ScriptItem::Line(ScriptLine {
+            id: "S01-L001".to_owned(),
+            scene: "S01".to_owned(),
+            cast: "蒼真".to_owned(),
+            segs: vec![Seg::Plain("abcdef".to_owned())],
+        })];
+        let timeline = selection_timeline();
+        let mut state = ScriptViewState::default();
+        let frame = ScriptFrame::new(&items, &timeline, 0, false, false);
+
+        let _ = draw_script_frame_with_controls(
+            &ctx,
+            frame,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(20.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+        let (_, seek_to) = draw_script_frame_with_controls(
+            &ctx,
+            frame,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(20.0, 15.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut state,
+        );
+
+        assert_eq!(seek_to, Some(0));
     }
 
     #[test]
