@@ -14,6 +14,7 @@ use crate::{
 
 const SPEAKER_WIDTH: f32 = 90.0;
 const RUBY_SCALE: f32 = 0.55;
+const SCRIPT_FONT_SCALE: f32 = 1.4;
 const KINSOKU_LINE_START: &str = "、。，．）」』】!?！？";
 const AUTO_SCROLL_EDGE: f32 = 24.0;
 const AUTO_SCROLL_MAX_DELTA: f32 = 18.0;
@@ -567,7 +568,7 @@ fn auto_scroll_delta(viewport: Rect, pointer: Pos2) -> f32 {
 }
 
 fn build_layout(ui: &egui::Ui, line: &ScriptLine, max_width: f32, show_ruby: bool) -> LineLayout {
-    let base_size = egui::TextStyle::Body.resolve(ui.style()).size;
+    let base_size = egui::TextStyle::Body.resolve(ui.style()).size * SCRIPT_FONT_SCALE;
     let ruby_size = base_size * RUBY_SCALE;
     let base_font = FontId::proportional(base_size);
     let ruby_font = FontId::proportional(ruby_size);
@@ -1504,18 +1505,24 @@ mod tests {
         })];
         let timeline = selection_timeline();
         let mut state = ScriptViewState::default();
+        let layout = draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state);
+        let start = drawn_text_rect(&layout.shapes, "a")
+            .expect("the first selected token must be drawn")
+            .center();
+        let end = drawn_text_rect(&layout.shapes, "d")
+            .expect("the last selected token must be drawn")
+            .center();
 
         for events in [
-            vec![],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(104.0, 15.0),
+                pos: start,
                 button: egui::PointerButton::Primary,
                 pressed: true,
                 modifiers: egui::Modifiers::NONE,
             }],
-            vec![egui::Event::PointerMoved(Pos2::new(124.0, 15.0))],
+            vec![egui::Event::PointerMoved(end)],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(124.0, 15.0),
+                pos: end,
                 button: egui::PointerButton::Primary,
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
@@ -1605,17 +1612,25 @@ mod tests {
             .collect::<Vec<_>>();
         let timeline = selection_timeline();
         let mut state = ScriptViewState::default();
+        let layout = draw_visual_frame(&ctx, &items, &timeline, 0, false, vec![], &mut state);
+        let ruby_rect =
+            drawn_text_rect(&layout.shapes, "東京").expect("the ruby base token must be drawn");
+        let start = ruby_rect.center();
+        let end = Pos2::new((start.x + ruby_rect.right()) * 0.5, start.y);
+        assert!(
+            ruby_rect.contains(end),
+            "short drag must stay inside ruby token"
+        );
         for events in [
-            vec![],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(115.0, 15.0),
+                pos: start,
                 button: egui::PointerButton::Primary,
                 pressed: true,
                 modifiers: egui::Modifiers::NONE,
             }],
-            vec![egui::Event::PointerMoved(Pos2::new(119.0, 15.0))],
+            vec![egui::Event::PointerMoved(end)],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(119.0, 15.0),
+                pos: end,
                 button: egui::PointerButton::Primary,
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
@@ -1656,29 +1671,40 @@ mod tests {
         let mut state = ScriptViewState::default();
         let mut seek_to = None;
         let mut seek_results = Vec::new();
+        let layout = ctx.run(selection_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                seek_to = draw_script(ui, &items, &timeline, 0, false, false, &mut state);
+            });
+        });
+        seek_results.push(seek_to);
+        let start = drawn_text_rect(&layout.shapes, "a")
+            .expect("the first selected token must be drawn")
+            .center();
+        let end = drawn_text_rect(&layout.shapes, "d")
+            .expect("the last selected token must be drawn")
+            .center();
         for events in [
-            vec![],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(104.0, 15.0),
+                pos: start,
                 button: egui::PointerButton::Primary,
                 pressed: true,
                 modifiers: egui::Modifiers::NONE,
             }],
-            vec![egui::Event::PointerMoved(Pos2::new(124.0, 15.0))],
+            vec![egui::Event::PointerMoved(end)],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(124.0, 15.0),
+                pos: end,
                 button: egui::PointerButton::Primary,
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
             }],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(124.0, 15.0),
+                pos: end,
                 button: egui::PointerButton::Secondary,
                 pressed: true,
                 modifiers: egui::Modifiers::NONE,
             }],
             vec![egui::Event::PointerButton {
-                pos: Pos2::new(124.0, 15.0),
+                pos: end,
                 button: egui::PointerButton::Secondary,
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
@@ -1743,7 +1769,7 @@ mod tests {
         for pressed in [true, false] {
             let _ = ctx.run(
                 selection_input(vec![egui::Event::PointerButton {
-                    pos: Pos2::new(124.0, 15.0),
+                    pos: end,
                     button: egui::PointerButton::Secondary,
                     pressed,
                     modifiers: egui::Modifiers::NONE,
