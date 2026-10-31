@@ -257,6 +257,8 @@ impl eframe::App for App {
                 && let Ok(mut transport) = self.transport.lock()
             {
                 apply_command(&mut transport, command);
+                // 停止中は自動再描画されないため、操作結果を次フレームで反映させる。
+                ctx.request_repaint();
             }
         });
         egui::SidePanel::right("meter")
@@ -300,6 +302,8 @@ impl eframe::App for App {
                 ) && let Ok(mut transport) = self.transport.lock()
                 {
                     transport.seek_ms(seek_to as i64);
+                    // 停止中も、選択した行の位置を次フレームで反映させる。
+                    ctx.request_repaint();
                 }
             } else {
                 ui.label("「台本を開く」から 第N回.txt を選んでください");
