@@ -222,7 +222,7 @@ impl eframe::App for App {
                     .count();
                 if missing_count > 0 {
                     ui.colored_label(
-                        egui::Color32::YELLOW,
+                        warning_color(ui),
                         format!("timeline.json と対応しない台本行: {missing_count}件"),
                     );
                 }
@@ -232,7 +232,7 @@ impl eframe::App for App {
                     .iter()
                     .filter(|warning| !is_line_availability_warning(warning))
                 {
-                    ui.colored_label(egui::Color32::YELLOW, warning);
+                    ui.colored_label(warning_color(ui), warning);
                 }
             }
             ui.horizontal(|ui| {
@@ -362,6 +362,15 @@ fn should_open_startup_file_dialog(
     dialog_was_shown: bool,
 ) -> bool {
     !script_path_was_provided && initial_frame_rendered && !dialog_was_shown
+}
+
+/// 警告の文字色。明るい背景では黄色が読めないため、濃いオレンジ系にする。
+fn warning_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::YELLOW
+    } else {
+        egui::Color32::from_rgb(190, 80, 0)
+    }
 }
 
 fn is_line_availability_warning(warning: &str) -> bool {

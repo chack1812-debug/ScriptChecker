@@ -10,7 +10,11 @@ static PANIC_DIALOG_SHOWN: AtomicBool = AtomicBool::new(false);
 fn main() {
     install_panic_dialog_hook();
     let script_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title(format!("ScriptChecker  Ver.{}", env!("CARGO_PKG_VERSION"))),
+        ..Default::default()
+    };
     if let Err(error) = eframe::run_native(
         "ScriptChecker",
         options,
