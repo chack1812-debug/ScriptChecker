@@ -8,3 +8,6 @@ target/
 
 # Beads(工程管理の状態。リポジトリには含めない)
 .beads/
+
+# 配布用 zip
+dist/

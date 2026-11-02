@@ -9,6 +9,15 @@ YouTube 番組制作の公開前チェックを助ける、Windows 向けのデ�
 - 6 つの再生操作と、全幅のシークバー
 - 台本の文字を選択してコピーできる(台本の修正指示に使えます)
 
+## ダウンロード
+
+ビルド済みの実行ファイル(Windows)は、[宇摩コードワークスのサイト](https://umacodeworks.jp/scriptchecker.html)で配布しています(GitHub には zip を置いていません)。
+
+- 配布ページ: <https://umacodeworks.jp/scriptchecker.html>
+- v0.1.1 の zip(直接): <https://umacodeworks.jp/downloads/ScriptChecker_v0.1.1.zip>
+
+zip には `scriptchecker.exe`・`README.md`・`LICENSE`・`THIRD-PARTY-NOTICES.txt` が入っています。展開して `scriptchecker.exe` を実行するだけで使えます(インストール不要)。配布用 zip は `scripts\package.ps1` で作れます。
+
 ## 必要なもの
 
 台本ファイルと同じフォルダに、以下が必要です。
