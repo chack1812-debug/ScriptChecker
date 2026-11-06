@@ -39,10 +39,8 @@ pub fn parse_segs(text: &str) -> Vec<Seg> {
         };
         let end = after_start + relative_end;
         let candidate = &text[after_start..end];
-        let mut parts = candidate.split('|');
-        let base = parts.next().unwrap_or_default();
-        let reading = parts.next();
-        if let Some(reading) = reading.filter(|_| parts.next().is_none())
+        // 区切りは最後の `|`。ルビを振る側(base)は `|` を含んでよい(Script2Video と同じ規則)。
+        if let Some((base, reading)) = candidate.rsplit_once('|')
             && !base.is_empty()
             && !reading.is_empty()
         {
@@ -141,6 +139,27 @@ mod tests {
                 if base == "Codex" && reading == "コーデックス" && tail == "の非対話"
         ));
         assert_eq!(display_text(&segs), "Codexの非対話");
+    }
+
+    #[test]
+    fn bar_in_base_uses_last_bar_as_separator() {
+        let segs = parse_segs("'&&|アンドアンド'、'|||オアオア'、';|セミコロン'、'||パイプ'、&");
+        assert_eq!(display_text(&segs), "&&、||、;、|、&");
+        let readings: Vec<&str> = segs
+            .iter()
+            .filter_map(|seg| match seg {
+                Seg::Ruby { reading, .. } => Some(reading.as_str()),
+                Seg::Plain(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            readings,
+            ["アンドアンド", "オアオア", "セミコロン", "パイプ"]
+        );
+        assert!(matches!(
+            parse_segs("'||'").as_slice(),
+            [Seg::Plain(text)] if text == "'||'"
+        ));
     }
 
     #[test]
